@@ -6,12 +6,12 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 
 ---
 
-## What's New in v0.1.3
+## What's New in v0.1.4
 
-- **Live Synced Lyrics** — Dedicated **Lyrics** tab in **Up Next** (plus a Lyrics button in the player bar) with timestamped line-by-line live highlighting, smooth auto-scroll, and click-to-seek via LRCLIB + YouTube Music fallback.
-- **Sub-Second Native Song Loading** — Extracts direct audio streams in pure Rust via InnerTube (pre-warming `visitorData` at startup) and fetches 1 MiB byte-range HTTP/2 chunks to avoid single-GET throttling, eliminating `yt-dlp` startup delays on normal tracks (`yt-dlp` remains as an automatic fallback).
-- **Live Search Preview Dropdown** — Debounced autocomplete below the search bar showing suggested search queries, artists/albums, and playable tracks with cover art while you type.
-- **Update Popup & 1-Click Updater** — Checks GitHub Releases automatically on launch (or from **Settings → About**), displays release notes in-app, and updates & restarts `hum.exe` in one click.
+- **Live Synced Lyrics & Artwork Polish** — Fixed `"Song • Artist"` metadata stripping so LRCLIB synced lyrics match reliably, replaced the mic icon with a clean lyrics bubble icon, enforced crisp square cover art in **Up Next**, and improved active/inactive lyric contrast with clickable line timestamps.
+- **Fast Cached Release Builds** — Shared Rust build cache on `main` across release tags in GitHub Actions.
+- **Sub-Second Native Song Loading** — Extracts direct audio streams in pure Rust via InnerTube (pre-warming `visitorData` at startup) and fetches 1 MiB byte-range HTTP/2 chunks cleanly (`yt-dlp` remains as an automatic fallback).
+- **Live Search Preview & Auto-Updater** — Debounced search suggestions as you type plus startup/Settings update popup with release notes and 1-click self-update.
 
 ---
 

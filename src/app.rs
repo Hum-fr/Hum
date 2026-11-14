@@ -2237,13 +2237,27 @@ impl Hum {
     fn view_up_next(&self) -> Element<'_, Message> {
         let left_panel: Element<'_, Message> = if let Some(track) = &self.now_playing {
             let liked = self.liked_ids.contains(&track.id);
+            let clean_artist = track
+                .artist
+                .split(" • ")
+                .map(str::trim)
+                .find(|s| {
+                    !s.is_empty()
+                        && !matches!(
+                            s.to_ascii_lowercase().as_str(),
+                            "song" | "video" | "single" | "ep" | "album" | "explicit"
+                        )
+                })
+                .unwrap_or(track.artist.as_str());
+
             container(
                 column![
-                    self.render_thumb(track.thumb_url.as_deref(), 290.0, 10.0),
-                    text(truncate_text(&track.title, 36))
+                    self.render_thumb(track.thumb_url.as_deref(), 260.0, 12.0),
+                    space::vertical().height(6),
+                    text(truncate_text(&track.title, 34))
                         .size(20)
                         .color(style::TEXT_PRIMARY),
-                    text(truncate_text(&track.artist, 40))
+                    text(truncate_text(clean_artist, 38))
                         .size(14)
                         .color(style::TEXT_SECONDARY),
                     row![
@@ -2262,10 +2276,11 @@ impl Hum {
                     ]
                     .spacing(8),
                 ]
-                .spacing(10)
+                .spacing(8)
                 .align_x(Alignment::Center),
             )
-            .width(Length::FillPortion(5))
+            .padding([24, 24])
+            .width(Length::FillPortion(4))
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -2276,7 +2291,7 @@ impl Hum {
                     .size(15)
                     .color(style::TEXT_MUTED),
             )
-            .width(Length::FillPortion(5))
+            .width(Length::FillPortion(4))
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -2306,7 +2321,7 @@ impl Hum {
                         .style(style::pill_button(false)),
                 );
 
-                let mut queue_rows = column![tabs_row].spacing(10);
+                let mut queue_rows = column![].spacing(4);
                 for (i, track) in self.queue.iter().enumerate() {
                     let is_active = self.current_index == Some(i);
                     queue_rows = queue_rows.push(self.view_track_row(
@@ -2320,21 +2335,34 @@ impl Hum {
                     ));
                 }
 
-                scrollable(queue_rows.padding([20, 20]))
-                    .width(Length::FillPortion(5))
-                    .height(Length::Fill)
-                    .into()
+                container(
+                    column![
+                        tabs_row,
+                        scrollable(queue_rows)
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    ]
+                    .spacing(14),
+                )
+                .padding([24, 28])
+                .width(Length::FillPortion(6))
+                .height(Length::Fill)
+                .into()
             }
             UpNextTab::Lyrics => {
                 if let Some(track) = &self.now_playing
                     && let Some(Ok(lyrics)) = self.lyrics_cache.get(&track.id)
                 {
                     let badge = if lyrics.synced {
-                        format!("{} • Live", lyrics.source)
+                        "Live synced"
                     } else {
-                        lyrics.source.clone()
+                        lyrics.source.as_str()
                     };
-                    tabs_row = tabs_row.push(text(badge).size(11).color(style::TEXT_MUTED));
+                    tabs_row = tabs_row.push(
+                        container(text(badge).size(11).color(style::TEXT_SECONDARY))
+                            .padding([4, 10])
+                            .style(style::modal_card),
+                    );
                 }
 
                 let lyrics_body: Element<'_, Message> = if let Some(track) = &self.now_playing {
@@ -2351,24 +2379,29 @@ impl Hum {
                         .into()
                     } else {
                         match self.lyrics_cache.get(&track.id) {
-                            Some(Ok(lyrics)) => {
+                            Some(Ok(lyrics)) if lyrics.synced => {
                                 let active_idx = self.current_lyric_index().map(|(i, _)| i);
-                                let mut lines_col = column![space::vertical().height(90)].spacing(6);
+                                let mut lines_col =
+                                    column![space::vertical().height(64)].spacing(8);
 
                                 for (i, line) in lyrics.lines.iter().enumerate() {
                                     let is_active = active_idx == Some(i);
                                     let is_past = active_idx.is_some_and(|cur| i < cur);
 
-                                    let color = if is_active || !lyrics.synced {
+                                    let color = if is_active {
                                         style::TEXT_PRIMARY
                                     } else if is_past {
-                                        style::TEXT_SECONDARY
+                                        Color::from_rgba(1.0, 1.0, 1.0, 0.48)
                                     } else {
-                                        style::TEXT_MUTED
+                                        Color::from_rgba(1.0, 1.0, 1.0, 0.30)
                                     };
-                                    let font_size = if is_active { 19 } else { 15 };
+                                    let font_size = if is_active { 22 } else { 17 };
+                                    let stamp = line
+                                        .time_ms
+                                        .map(|ms| format_time(ms / 1000))
+                                        .unwrap_or_default();
 
-                                    let bar = container(space::horizontal().width(3).height(20))
+                                    let bar = container(space::horizontal().width(3).height(22))
                                         .style(move |_: &Theme| container::Style {
                                             background: Some(Background::Color(if is_active {
                                                 style::YT_RED
@@ -2383,13 +2416,26 @@ impl Hum {
                                         });
 
                                     let mut btn = button(
-                                        row![bar, text(&line.text).size(font_size).color(color)]
-                                            .spacing(10)
-                                            .align_y(Alignment::Center),
+                                        row![
+                                            bar,
+                                            text(&line.text)
+                                                .size(font_size)
+                                                .color(color)
+                                                .width(Length::Fill),
+                                            text(stamp)
+                                                .size(11)
+                                                .color(if is_active {
+                                                    style::TEXT_SECONDARY
+                                                } else {
+                                                    Color::from_rgba(1.0, 1.0, 1.0, 0.22)
+                                                }),
+                                        ]
+                                        .spacing(12)
+                                        .align_y(Alignment::Center),
                                     )
-                                    .padding([6, 8])
+                                    .padding([10, 14])
                                     .width(Length::Fill)
-                                    .style(style::track_row(false));
+                                    .style(style::track_row(is_active));
 
                                     if let Some(ms) = line.time_ms {
                                         btn = btn.on_press(Message::SeekToMs(ms));
@@ -2397,9 +2443,27 @@ impl Hum {
                                     lines_col = lines_col.push(btn);
                                 }
 
-                                lines_col = lines_col.push(space::vertical().height(120));
+                                lines_col = lines_col.push(space::vertical().height(96));
 
-                                scrollable(lines_col.padding([0, 12]))
+                                scrollable(lines_col.padding([0, 8]))
+                                    .id(self.lyrics_scroll_id.clone())
+                                    .width(Length::Fill)
+                                    .height(Length::Fill)
+                                    .into()
+                            }
+                            Some(Ok(lyrics)) => {
+                                let mut lines_col =
+                                    column![space::vertical().height(8)].spacing(10);
+                                for line in &lyrics.lines {
+                                    lines_col = lines_col.push(
+                                        text(&line.text)
+                                            .size(16)
+                                            .color(Color::from_rgb(0.86, 0.86, 0.88)),
+                                    );
+                                }
+                                lines_col = lines_col.push(space::vertical().height(32));
+
+                                scrollable(lines_col.padding([0, 8]))
                                     .id(self.lyrics_scroll_id.clone())
                                     .width(Length::Fill)
                                     .height(Length::Fill)
@@ -2438,9 +2502,9 @@ impl Hum {
                     .into()
                 };
 
-                container(column![tabs_row, lyrics_body].spacing(12))
-                    .padding([20, 20])
-                    .width(Length::FillPortion(5))
+                container(column![tabs_row, lyrics_body].spacing(14))
+                    .padding([24, 28])
+                    .width(Length::FillPortion(6))
                     .height(Length::Fill)
                     .into()
             }
@@ -3192,12 +3256,17 @@ impl Hum {
         if let Some(u) = url
             && let Some(handle) = self.thumbs.get(u)
         {
-            return image(handle.clone())
-                .width(size)
-                .height(size)
-                .content_fit(ContentFit::Cover)
-                .border_radius(radius)
-                .into();
+            return container(
+                image(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(ContentFit::Cover)
+                    .border_radius(radius),
+            )
+            .width(size)
+            .height(size)
+            .clip(true)
+            .into();
         }
 
         container(icons::note(size * 0.36, style::TEXT_MUTED))

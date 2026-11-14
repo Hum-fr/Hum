@@ -405,13 +405,14 @@ fn parse_shelf_item(raw: &Value) -> Option<ShelfItem> {
         .pointer("/navigationEndpoint/watchEndpoint/videoId")
         .and_then(|v| v.as_str())
     {
+        let cleaned_artist = extract_primary_artist(&subtitle);
         return Some(ShelfItem::Song(Track {
             id: video_id.to_string(),
             title,
-            artist: if subtitle.is_empty() {
+            artist: if cleaned_artist.is_empty() {
                 String::from("YouTube Music")
             } else {
-                subtitle
+                cleaned_artist
             },
             album: None,
             duration_label: String::from("--:--"),
@@ -1318,6 +1319,25 @@ pub async fn fetch_track_lyrics(
     Err(String::from("No lyrics found for this track."))
 }
 
+fn extract_primary_artist(raw: &str) -> String {
+    let part = raw
+        .split(" • ")
+        .map(str::trim)
+        .find(|seg| {
+            !seg.is_empty()
+                && !matches!(
+                    seg.to_ascii_lowercase().as_str(),
+                    "song" | "video" | "single" | "ep" | "album" | "explicit"
+                )
+        })
+        .unwrap_or_else(|| raw.trim());
+
+    part.strip_suffix(" - Topic")
+        .unwrap_or(part)
+        .trim()
+        .to_string()
+}
+
 fn clean_track_meta(title: &str, artist: &str) -> (String, String) {
     let strip_brackets = |input: &str| -> String {
         let mut out = String::with_capacity(input.len());
@@ -1349,16 +1369,7 @@ fn clean_track_meta(title: &str, artist: &str) -> (String, String) {
         clean_title
     };
 
-    let clean_artist = artist
-        .split(" • ")
-        .next()
-        .unwrap_or(artist)
-        .trim()
-        .strip_suffix(" - Topic")
-        .unwrap_or_else(|| artist.split(" • ").next().unwrap_or(artist).trim())
-        .trim()
-        .to_string();
-
+    let clean_artist = extract_primary_artist(artist);
     (final_title, clean_artist)
 }
 
@@ -1780,6 +1791,10 @@ mod tests {
         );
         assert_eq!(title, "Lucid Dreams");
         assert_eq!(artist, "Juice WRLD");
+
+        let (t2, a2) = clean_track_meta("wheredoistart", "Song • Ken Carson");
+        assert_eq!(t2, "wheredoistart");
+        assert_eq!(a2, "Ken Carson");
     }
 
     #[tokio::test]

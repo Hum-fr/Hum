@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -15,6 +17,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "hum-windows-release"
+          cache-on-failure: true
 
       - name: Download yt-dlp for embedding
         shell: pwsh
@@ -28,6 +33,7 @@ jobs:
         run: cargo build --release
 
       - name: Package Windows release
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
@@ -38,6 +44,7 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath hum-windows-x86_64.zip -Force
 
       - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

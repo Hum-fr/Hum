@@ -1,7 +1,5 @@
-## What's New in v0.1.3
+## What's New in v0.1.4
 
 ### Highlights
-- **Live Synced Lyrics** — Added a **Lyrics** tab in the Up Next view and a quick **Lyrics** button in the bottom player bar:
-  - Fetches timestamped lyrics from LRCLIB (with YouTube Music lyrics as fallback)
-  - Highlights the active line live as the song plays and auto-scrolls smoothly with playback
-  - Click any synced lyric line to seek straight to that moment in the song
+- **Fixed Live Synced Lyrics Matching & Redesign** — Fixed YouTube Music `"Song • Artist"` metadata strings breaking LRCLIB synced-lyrics matching, redesigned the **Lyrics** icon to a clean quote/lyrics bubble, fixed clipped/narrow square album artwork in **Up Next**, and gave synced lyrics larger active-line typography, timestamps, and softer inactive lines.
+- **Much Faster GitHub Release CI** — Shared `rust-cache` across `main` and release tags so releases don't rebuild all ~800 crates from scratch every time.
