@@ -185,3 +185,35 @@ pub fn lyrics<'a>(size: f32, color: Color) -> svg::Svg<'a> {
         color,
     )
 }
+
+pub fn forward<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn chevron_down<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn menu<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h12"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn hum_mark<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 10v4"/><path d="M9.5 6v12"/><path d="M14.5 4v16"/><path d="M19 8v8"/></svg>"#,
+        size,
+        color,
+    )
+}

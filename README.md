@@ -6,12 +6,12 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 
 ---
 
-## What's New in v0.1.4
+## What's New in v0.1.5
 
-- **Live Synced Lyrics & Artwork Polish** — Fixed `"Song • Artist"` metadata stripping so LRCLIB synced lyrics match reliably, replaced the mic icon with a clean lyrics bubble icon, enforced crisp square cover art in **Up Next**, and improved active/inactive lyric contrast with clickable line timestamps.
-- **Fast Cached Release Builds** — Shared Rust build cache on `main` across release tags in GitHub Actions.
-- **Sub-Second Native Song Loading** — Extracts direct audio streams in pure Rust via InnerTube (pre-warming `visitorData` at startup) and fetches 1 MiB byte-range HTTP/2 chunks cleanly (`yt-dlp` remains as an automatic fallback).
-- **Live Search Preview & Auto-Updater** — Debounced search suggestions as you type plus startup/Settings update popup with release notes and 1-click self-update.
+- **Dynamic Ambient Obsidian UI Redesign** — Real-time palette extraction from playing album art drives ambient background gradients and dynamic player accents, paired with a custom `hum` soundwave brand mark, frosted glass surfaces, collapsible sidebar, and real `<` / `>` Back & Forward page history.
+- **3-Column Quick Picks & Search Hero** — Home Quick Picks now render in a crisp 3-column grid, and Search leads with a **Top result** glass hero card alongside top **Songs**.
+- **Full-Bleed Now Playing & Balanced Player Bar** — Dedicated full-bleed Lyrics / Up Next stage with large cover artwork and spacious clickable synced lyrics, plus a balanced 3-section player bar.
+- **Sub-Second Native Song Loading & Auto-Updater** — Pure-Rust InnerTube + byte-range HTTP/2 streaming, debounced live search preview dropdown, LRCLIB + YTM synced lyrics, and 1-click self-updater.
 
 ---
 

@@ -1,22 +1,137 @@
+use iced::gradient::Linear;
 use iced::widget::{button, container, slider, text_input};
-use iced::{Background, Border, Color, Theme, color};
+use iced::{Background, Border, Color, Gradient, Radians, Theme, color};
 
-pub const BG_CANVAS: Color = color!(0x030303);
-pub const BG_SIDEBAR: Color = color!(0x030303);
-pub const BG_HEADER: Color = color!(0x0A0A0A);
-pub const BG_PLAYER: Color = color!(0x212121);
-pub const BG_CARD: Color = color!(0x121212);
-pub const BG_HOVER: Color = color!(0x282828);
-pub const BG_PILL: Color = color!(0x1E1E1E);
-pub const BORDER: Color = color!(0x272727);
-pub const TEXT_PRIMARY: Color = color!(0xFFFFFF);
-pub const TEXT_SECONDARY: Color = color!(0xAAAAAA);
-pub const TEXT_MUTED: Color = color!(0x717171);
-pub const YT_RED: Color = color!(0xFF0000);
+pub const BG_CANVAS: Color = color!(0x090A0F);
+pub const BG_SIDEBAR: Color = Color::from_rgba(0.04, 0.045, 0.065, 0.72);
+pub const BG_HEADER: Color = Color::TRANSPARENT;
+pub const BG_PLAYER: Color = Color::from_rgba(0.045, 0.05, 0.07, 0.90);
+pub const BG_CARD: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.045);
+pub const BG_HOVER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.095);
+pub const BG_PILL: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.07);
+pub const BORDER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.09);
+pub const TEXT_PRIMARY: Color = color!(0xF5F6FA);
+pub const TEXT_SECONDARY: Color = color!(0xA7ACBA);
+pub const TEXT_MUTED: Color = color!(0x6E7382);
+pub const YT_RED: Color = color!(0xFF3355);
+
+#[derive(Debug, Clone, Copy)]
+pub struct CoverPalette {
+    pub primary: Color,
+    pub secondary: Color,
+    pub accent: Color,
+}
+
+impl Default for CoverPalette {
+    fn default() -> Self {
+        Self {
+            primary: Color::from_rgb(0.14, 0.08, 0.14),
+            secondary: Color::from_rgb(0.07, 0.10, 0.17),
+            accent: YT_RED,
+        }
+    }
+}
+
+pub fn extract_cover_palette(bytes: &[u8]) -> CoverPalette {
+    let Ok(img) = image::load_from_memory(bytes) else {
+        return CoverPalette::default();
+    };
+    let thumb = img
+        .resize_exact(16, 16, image::imageops::FilterType::Nearest)
+        .to_rgb8();
+
+    let mut buckets: [(f32, f32, f32, f32); 2] = [(0.0, 0.0, 0.0, 0.0); 2];
+    for (idx, p) in thumb.pixels().enumerate() {
+        let r = p[0] as f32 / 255.0;
+        let g = p[1] as f32 / 255.0;
+        let b = p[2] as f32 / 255.0;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let sat = if max > 0.001 { (max - min) / max } else { 0.0 };
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        // Prefer rich mid-tone colors over pure black/white borders.
+        let luma_weight = if (0.08..=0.88).contains(&luma) { 1.0 } else { 0.2 };
+        let weight = (0.15 + sat * 2.5) * luma_weight;
+        let slot = usize::from(idx >= 128);
+        buckets[slot].0 += r * weight;
+        buckets[slot].1 += g * weight;
+        buckets[slot].2 += b * weight;
+        buckets[slot].3 += weight;
+    }
+
+    let avg = |(sr, sg, sb, sw): (f32, f32, f32, f32)| -> (f32, f32, f32) {
+        if sw > 0.001 {
+            (sr / sw, sg / sw, sb / sw)
+        } else {
+            (0.14, 0.10, 0.18)
+        }
+    };
+
+    let (r1, g1, b1) = avg(buckets[0]);
+    let (r2, g2, b2) = avg(buckets[1]);
+
+    // Scale mood colors into deep, readable dark surfaces so white typography stays crisp.
+    let mood = |r: f32, g: f32, b: f32, gain: f32| {
+        let lum = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(0.05);
+        let scale = (0.24 / lum).min(1.15) * gain;
+        Color::from_rgb(
+            (r * scale + 0.03).clamp(0.03, 0.34),
+            (g * scale + 0.03).clamp(0.03, 0.30),
+            (b * scale + 0.05).clamp(0.05, 0.38),
+        )
+    };
+
+    let accent = Color::from_rgb(
+        (r1 * 0.8 + 0.28).clamp(0.45, 1.0),
+        (g1 * 0.8 + 0.20).clamp(0.32, 0.92),
+        (b1 * 0.8 + 0.24).clamp(0.38, 0.98),
+    );
+
+    CoverPalette {
+        primary: mood(r1, g1, b1, 0.92),
+        secondary: mood(r2, g2, b2, 0.78),
+        accent,
+    }
+}
+
+pub fn ambient_canvas(palette: CoverPalette) -> impl Fn(&Theme) -> container::Style {
+    let top = Color::from_rgba(palette.primary.r, palette.primary.g, palette.primary.b, 0.55);
+    let mid = Color::from_rgb(0.045, 0.05, 0.07);
+    let bot = Color::from_rgba(
+        palette.secondary.r,
+        palette.secondary.g,
+        palette.secondary.b,
+        0.40,
+    );
+    move |_theme| {
+        let grad = Linear::new(Radians(2.45))
+            .add_stop(0.0, top)
+            .add_stop(0.48, mid)
+            .add_stop(1.0, bot);
+        container::Style {
+            background: Some(Background::Gradient(Gradient::Linear(grad))),
+            ..Default::default()
+        }
+    }
+}
+
+pub fn now_playing_canvas(palette: CoverPalette) -> impl Fn(&Theme) -> container::Style {
+    let deep = Color::from_rgb(0.035, 0.04, 0.058);
+    move |_theme| {
+        let grad = Linear::new(Radians(2.2))
+            .add_stop(0.0, palette.primary)
+            .add_stop(0.55, palette.secondary)
+            .add_stop(1.0, deep);
+        container::Style {
+            background: Some(Background::Gradient(Gradient::Linear(grad))),
+            ..Default::default()
+        }
+    }
+}
 
 pub fn app_theme() -> Theme {
     Theme::custom(
-        "YouTube Music".to_string(),
+        "hum".to_string(),
         iced::theme::Palette {
             background: BG_CANVAS,
             text: TEXT_PRIMARY,
@@ -43,11 +158,6 @@ pub fn sidebar(_theme: &Theme) -> container::Style {
 pub fn header_bar(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(BG_HEADER)),
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
         ..Default::default()
     }
 }
@@ -55,6 +165,11 @@ pub fn header_bar(_theme: &Theme) -> container::Style {
 pub fn player_bar(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(BG_PLAYER)),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
         ..Default::default()
     }
 }
@@ -72,7 +187,7 @@ pub fn thumb_box(_theme: &Theme) -> container::Style {
         border: Border {
             color: BORDER,
             width: 1.0,
-            radius: 4.0.into(),
+            radius: 6.0.into(),
         },
         ..Default::default()
     }
@@ -82,7 +197,7 @@ pub fn brand_circle(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(YT_RED)),
         border: Border {
-            radius: 14.0.into(),
+            radius: 10.0.into(),
             ..Default::default()
         },
         ..Default::default()
@@ -91,11 +206,23 @@ pub fn brand_circle(_theme: &Theme) -> container::Style {
 
 pub fn modal_card(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(color!(0x181818))),
+        background: Some(Background::Color(color!(0x13151D))),
         border: Border {
-            color: color!(0x353535),
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.12),
             width: 1.0,
-            radius: 12.0.into(),
+            radius: 14.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+pub fn glass_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.055))),
+        border: Border {
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.09),
+            width: 1.0,
+            radius: 14.0.into(),
         },
         ..Default::default()
     }
@@ -103,8 +230,14 @@ pub fn modal_card(_theme: &Theme) -> container::Style {
 
 pub fn search_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
     let (bg, border) = match status {
-        text_input::Status::Focused { .. } => (color!(0x181818), color!(0x555555)),
-        text_input::Status::Hovered => (color!(0x222222), color!(0x383838)),
+        text_input::Status::Focused { .. } => (
+            Color::from_rgba(1.0, 1.0, 1.0, 0.11),
+            Color::from_rgba(1.0, 1.0, 1.0, 0.25),
+        ),
+        text_input::Status::Hovered => (
+            Color::from_rgba(1.0, 1.0, 1.0, 0.09),
+            Color::from_rgba(1.0, 1.0, 1.0, 0.16),
+        ),
         _ => (BG_PILL, BORDER),
     };
 
@@ -118,7 +251,7 @@ pub fn search_input(_theme: &Theme, status: text_input::Status) -> text_input::S
         icon: TEXT_SECONDARY,
         placeholder: TEXT_MUTED,
         value: TEXT_PRIMARY,
-        selection: color!(0x3D3D3D),
+        selection: Color::from_rgba(1.0, 1.0, 1.0, 0.22),
     }
 }
 
@@ -146,9 +279,9 @@ pub fn plain_input(_theme: &Theme, status: text_input::Status) -> text_input::St
 pub fn nav_item(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let bg = if active {
-            BG_HOVER
+            Color::from_rgba(1.0, 1.0, 1.0, 0.10)
         } else if matches!(status, button::Status::Hovered) {
-            color!(0x181818)
+            Color::from_rgba(1.0, 1.0, 1.0, 0.055)
         } else {
             Color::TRANSPARENT
         };
@@ -157,7 +290,7 @@ pub fn nav_item(active: bool) -> impl Fn(&Theme, button::Status) -> button::Styl
             background: Some(Background::Color(bg)),
             text_color: if active { TEXT_PRIMARY } else { TEXT_SECONDARY },
             border: Border {
-                radius: 8.0.into(),
+                radius: 10.0.into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -168,9 +301,9 @@ pub fn nav_item(active: bool) -> impl Fn(&Theme, button::Status) -> button::Styl
 pub fn track_row(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let bg = match (active, status) {
-            (true, button::Status::Hovered) => color!(0x262626),
-            (true, _) => color!(0x1D1D1D),
-            (false, button::Status::Hovered) => color!(0x181818),
+            (true, button::Status::Hovered) => Color::from_rgba(1.0, 1.0, 1.0, 0.13),
+            (true, _) => Color::from_rgba(1.0, 1.0, 1.0, 0.09),
+            (false, button::Status::Hovered) => Color::from_rgba(1.0, 1.0, 1.0, 0.06),
             (false, button::Status::Pressed) => BG_HOVER,
             _ => Color::TRANSPARENT,
         };
@@ -179,7 +312,7 @@ pub fn track_row(active: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
             background: Some(Background::Color(bg)),
             text_color: TEXT_PRIMARY,
             border: Border {
-                radius: 6.0.into(),
+                radius: 10.0.into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -187,9 +320,27 @@ pub fn track_row(active: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
     }
 }
 
+pub fn lyric_row(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Color::from_rgba(1.0, 1.0, 1.0, 0.055),
+        button::Status::Pressed => Color::from_rgba(1.0, 1.0, 1.0, 0.09),
+        _ => Color::TRANSPARENT,
+    };
+
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: TEXT_PRIMARY,
+        border: Border {
+            radius: 12.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 pub fn card_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered => color!(0x181818),
+        button::Status::Hovered => Color::from_rgba(1.0, 1.0, 1.0, 0.06),
         button::Status::Pressed => BG_HOVER,
         _ => Color::TRANSPARENT,
     };
@@ -198,7 +349,7 @@ pub fn card_button(_theme: &Theme, status: button::Status) -> button::Style {
         background: Some(Background::Color(bg)),
         text_color: TEXT_PRIMARY,
         border: Border {
-            radius: 8.0.into(),
+            radius: 12.0.into(),
             ..Default::default()
         },
         ..Default::default()
@@ -209,12 +360,12 @@ pub fn mood_pill(accent: u32) -> impl Fn(&Theme, button::Status) -> button::Styl
     let r = ((accent >> 16) & 0xFF) as f32 / 255.0;
     let g = ((accent >> 8) & 0xFF) as f32 / 255.0;
     let b = (accent & 0xFF) as f32 / 255.0;
-    let stripe = Color::from_rgb(r, g, b);
+    let stripe = Color::from_rgba(r, g, b, 0.65);
 
     move |_theme, status| {
         let bg = match status {
             button::Status::Hovered => BG_HOVER,
-            button::Status::Pressed => color!(0x303030),
+            button::Status::Pressed => Color::from_rgba(1.0, 1.0, 1.0, 0.14),
             _ => BG_CARD,
         };
 
@@ -223,8 +374,8 @@ pub fn mood_pill(accent: u32) -> impl Fn(&Theme, button::Status) -> button::Styl
             text_color: TEXT_PRIMARY,
             border: Border {
                 color: stripe,
-                width: 1.5,
-                radius: 8.0.into(),
+                width: 1.0,
+                radius: 18.0.into(),
             },
             ..Default::default()
         }
@@ -233,8 +384,8 @@ pub fn mood_pill(accent: u32) -> impl Fn(&Theme, button::Status) -> button::Styl
 
 pub fn icon_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered => color!(0x323232),
-        button::Status::Pressed => color!(0x3E3E3E),
+        button::Status::Hovered => Color::from_rgba(1.0, 1.0, 1.0, 0.10),
+        button::Status::Pressed => Color::from_rgba(1.0, 1.0, 1.0, 0.16),
         _ => Color::TRANSPARENT,
     };
 
@@ -253,14 +404,14 @@ pub fn pill_button(primary: bool) -> impl Fn(&Theme, button::Status) -> button::
     move |_theme, status| {
         let bg = if primary {
             match status {
-                button::Status::Hovered => color!(0xE5E5E5),
-                button::Status::Pressed => color!(0xCCCCCC),
+                button::Status::Hovered => color!(0xE6E9F0),
+                button::Status::Pressed => color!(0xCFD4DF),
                 _ => TEXT_PRIMARY,
             }
         } else {
             match status {
                 button::Status::Hovered => BG_HOVER,
-                button::Status::Pressed => color!(0x333333),
+                button::Status::Pressed => Color::from_rgba(1.0, 1.0, 1.0, 0.14),
                 _ => BG_PILL,
             }
         };
@@ -280,8 +431,8 @@ pub fn pill_button(primary: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 pub fn play_circle(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered => color!(0xE6E6E6),
-        button::Status::Pressed => color!(0xCCCCCC),
+        button::Status::Hovered => color!(0xE6E9F0),
+        button::Status::Pressed => color!(0xCFD4DF),
         _ => TEXT_PRIMARY,
     };
 
@@ -296,29 +447,31 @@ pub fn play_circle(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-pub fn yt_progress_slider(_theme: &Theme, status: slider::Status) -> slider::Style {
-    let handle_radius = match status {
-        slider::Status::Hovered | slider::Status::Dragged => 6.0,
-        slider::Status::Active => 0.0,
-    };
+pub fn yt_progress_slider(accent: Color) -> impl Fn(&Theme, slider::Status) -> slider::Style {
+    move |_theme, status| {
+        let handle_radius = match status {
+            slider::Status::Hovered | slider::Status::Dragged => 5.5,
+            slider::Status::Active => 0.0,
+        };
 
-    slider::Style {
-        rail: slider::Rail {
-            backgrounds: (
-                Background::Color(YT_RED),
-                Background::Color(color!(0x404040)),
-            ),
-            width: 3.0,
-            border: Border::default(),
-        },
-        handle: slider::Handle {
-            shape: slider::HandleShape::Circle {
-                radius: handle_radius,
+        slider::Style {
+            rail: slider::Rail {
+                backgrounds: (
+                    Background::Color(accent),
+                    Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.16)),
+                ),
+                width: 3.0,
+                border: Border::default(),
             },
-            background: Background::Color(YT_RED),
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
-        },
+            handle: slider::Handle {
+                shape: slider::HandleShape::Circle {
+                    radius: handle_radius,
+                },
+                background: Background::Color(TEXT_PRIMARY),
+                border_width: 0.0,
+                border_color: Color::TRANSPARENT,
+            },
+        }
     }
 }
 
@@ -348,5 +501,19 @@ pub fn volume_slider(_theme: &Theme, status: slider::Status) -> slider::Style {
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_cover_palette_handles_invalid_bytes() {
+        let palette = extract_cover_palette(b"not-an-image");
+        let fallback = CoverPalette::default();
+        assert_eq!(palette.primary, fallback.primary);
+        assert_eq!(palette.secondary, fallback.secondary);
+        assert_eq!(palette.accent, fallback.accent);
     }
 }
