@@ -16,23 +16,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
+      - name: Download yt-dlp for embedding
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path vendor | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile "vendor\yt-dlp.exe"
+
+      - name: Build release binary with embedded yt-dlp
         env:
-          HUM_GOOGLE_CLIENT_ID: ${{ secrets.HUM_GOOGLE_CLIENT_ID }}
-          HUM_GOOGLE_CLIENT_SECRET: ${{ secrets.HUM_GOOGLE_CLIENT_SECRET }}
+          HUM_EMBED_YT_DLP: ${{ github.workspace }}\vendor\yt-dlp.exe
         run: cargo build --release
 
-      - name: Package Windows release with yt-dlp
+      - name: Package Windows release
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\hum.exe dist\hum.exe
+          Copy-Item target\release\hum.exe hum.exe
           Copy-Item LICENSE dist\LICENSE
           Copy-Item README.md dist\README.md
-          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile "dist\yt-dlp.exe"
           Compress-Archive -Path dist\* -DestinationPath hum-windows-x86_64.zip -Force
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: hum-windows-x86_64.zip
+          generate_release_notes: true
+          body_path: CHANGELOG.md
+          files: |
+            hum.exe
+            hum-windows-x86_64.zip

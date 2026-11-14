@@ -1,31 +1,43 @@
 # hum
 
-A fast, low-overhead desktop client for YouTube Music built in pure Rust.
+A fast, native desktop client for YouTube Music built in pure Rust.
 
 Most desktop wrappers load the entire `music.youtube.com` web app inside Electron or a browser view, burning 200–400 MB of RAM just to play audio. `hum` uses a native GPU-accelerated `iced` interface, queries YouTube Music directly, and decodes audio natively with `rodio`—keeping idle CPU near zero and memory usage around a few dozen megabytes.
+
+---
+
+## What's New in v0.1.1
+
+- **Faster Audio Startup & Decoding** — Direct stream URL extraction paired with native HTTP/2 Rust downloads, magic-byte container sniffing (`m4a`/`mp3`/`ogg`/`flac`/`wav`) to skip redundant probes, configurable multi-track queue prefetching, and a local disk audio cache for instant replays.
+- **Embedded `yt-dlp`** — GitHub Release builds now bundle `yt-dlp.exe` directly inside `hum.exe` (extracted automatically on first run to `%LOCALAPPDATA%\hum\`). No extra files or manual setup needed.
+- **Google Profile Pictures** — Displays your circular Google account avatar in the top header, account modal, and Settings page.
+- **Settings Page** — Dedicated **Settings** view in the sidebar for Account management, Audio engine status & one-click `yt-dlp` updates, Disk audio cache toggles & cleanup, Queue prefetch depth (`Off` / `1` / `2` tracks), persistent Volume, Listening history cleanup, and Keyboard shortcuts.
+- **Zero-Config Google Sign-In** — Built-in WebView2 **"Sign in to YouTube Music"** popup syncs your personalized Home feed, YouTube Music playlists, and liked songs with no Google Cloud setup required.
 
 ---
 
 ## Features
 
 - **YouTube Music Browse & Search**
-  - **Home** feed with *Listen again* history, Quick Picks, and curated mixes/albums
+  - **Home** feed with *Listen again* history, Quick Picks, and curated mixes/albums (personalized when signed in)
   - **Explore** page with Moods & Genres pills, New Releases, and trending shelves
   - **Search** across both individual **Songs** and **Playlists & Mixes**
-- **Native Audio Playback**
-  - Buffered native playback via `rodio` + `symphonia` (`m4a`/AAC, `mp3`, `vorbis`)
-  - Accurate container-decoded track durations and instant seeking
-  - Shuffle, Repeat (`Off` / `All` / `One`), volume slider, and quick mute toggle
+- **Fast Native Audio Playback**
+  - Direct stream extraction + native Rust HTTP/2 download with `yt-dlp` fallback
+  - Zero-copy `rodio` + `symphonia` decoding with magic-byte MIME hints (`m4a`/AAC, `mp3`, `vorbis`, `flac`, `wav`)
+  - Local disk LRU audio cache (up to 300 MB) and background queue prefetching (`0`–`2` tracks ahead)
+  - Shuffle, Repeat (`Off` / `All` / `One`), volume slider, quick mute toggle, and accurate seeking
   - Dedicated background audio thread that sleeps completely when idle or paused
 - **Queue & Local Library**
   - **Up Next** split view (large cover art + interactive queue with item removal & clear)
-  - **Liked music** and **custom playlists** (create, delete, add/remove tracks) stored locally in `%LOCALAPPDATA%\hum\`
-  - **Listen again** history tracking
-- **Google Authorization (OAuth 2.0)**
-  - Browser-based **Authorize with Google** (OAuth 2.0 PKCE + localhost callback)
-  - Syncs your Google YouTube playlists and liked videos via the YouTube Data API v3
-- **One-Click Audio Setup**
-  - Bundles or downloads `yt-dlp` in one click from the top bar when missing
+  - **Liked music**, **custom playlists**, and **Listen again** history stored in `%LOCALAPPDATA%\hum\`
+- **Google Account Sync (WebView2)**
+  - 1-click **Sign in** opens an embedded `"Sign in to YouTube Music"` window
+  - Syncs your Google avatar, account name/email, personalized Home feed, YouTube Music playlists, and Liked Music
+- **Settings**
+  - Toggle disk audio cache, inspect cached size & clear cache, configure prefetch depth, update `yt-dlp`, clear listening history, and view saved data paths
+- **Single-File Portable Releases**
+  - Official releases embed `yt-dlp.exe` right inside `hum.exe`
 
 ---
 
@@ -43,9 +55,10 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 
 ## Download & Run
 
-1. Download the latest `hum-windows-x86_64.zip` from **Releases**.
-2. Extract the archive (it includes both `hum.exe` and `yt-dlp.exe`).
-3. Run `hum.exe`.
+1. Download **`hum.exe`** (or `hum-windows-x86_64.zip`) from [**Releases**](https://github.com/Hum-fr/Hum/releases).
+2. Double-click `hum.exe` to run—audio and Google sign-in work right out of the box.
+
+All user data (Google session, liked music, playlists, history, settings, audio cache) is stored in `%LOCALAPPDATA%\hum\`, so updating `hum.exe` keeps your library intact.
 
 ---
 
@@ -62,7 +75,14 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 cargo run --release
 ```
 
-If `yt-dlp` is not already in your `PATH`, click **Setup audio** in the top-right bar on first launch to download `yt-dlp.exe` into `%LOCALAPPDATA%\hum\`.
+To embed `yt-dlp.exe` into your own local build, set `HUM_EMBED_YT_DLP` (or place `yt-dlp.exe` in `vendor/`):
+
+```powershell
+$env:HUM_EMBED_YT_DLP = "C:\path\to\yt-dlp.exe"
+cargo build --release
+```
+
+Otherwise, click **Setup audio** in the top-right bar (or **Install yt-dlp** in **Settings**) on first launch to download `yt-dlp.exe` into `%LOCALAPPDATA%\hum\`.
 
 ### Tests
 
@@ -76,39 +96,20 @@ cargo test -- --ignored --nocapture
 
 ---
 
-## Google OAuth Setup (Optional)
-
-You can browse, search, play music, like songs, and manage local playlists without signing in.
-
-To enable 1-click **Continue with Google** in your own builds / GitHub Releases:
-
-1. Open [Google Cloud Console](https://console.cloud.google.com/) and create (or select) a project.
-2. Enable the **YouTube Data API v3**.
-3. Configure the **OAuth consent screen** (External, add test users while in Testing or publish the app).
-4. Go to **Credentials → Create Credentials → OAuth client ID** and choose **Desktop app**.
-5. Set `HUM_GOOGLE_CLIENT_ID` and `HUM_GOOGLE_CLIENT_SECRET` when building (or add them as GitHub repository secrets for the Release workflow):
-   ```powershell
-   $env:HUM_GOOGLE_CLIENT_ID = "your-client-id.apps.googleusercontent.com"
-   $env:HUM_GOOGLE_CLIENT_SECRET = "your-client-secret"
-   cargo build --release
-   ```
-
-Once baked into the release binary, end users never see any OAuth IDs—they just click **Sign in → Continue with Google**.
-
----
-
 ## Project Layout
 
 ```text
+build.rs             # Optional compile-time yt-dlp embedding
 src/
-├── main.rs      # Window config and app entry point
-├── app.rs       # Application state, views, modals, keyboard shortcuts
-├── audio.rs     # Dedicated rodio playback thread and snapshot tracking
-├── auth.rs      # Google OAuth 2.0 PKCE + YouTube API sync + local JSON storage
-├── ytmusic.rs   # YouTube Music InnerTube browse/search & yt-dlp audio loader
-├── icons.rs     # Inline SVG vector icons
-├── style.rs     # YouTube Music dark theme & widget styling
-└── types.rs     # Shared domain types and formatting helpers
+├── main.rs          # App entry point & --ytm-signin subprocess dispatch
+├── app.rs           # Application state, views, Settings, modals, shortcuts
+├── audio.rs         # Dedicated rodio playback thread with fast container hinting
+├── auth.rs          # WebView2 YouTube Music session, library sync & local JSON storage
+├── webview_login.rs # Embedded WebView2 "Sign in to YouTube Music" popup window
+├── ytmusic.rs       # InnerTube browse/search, direct stream downloader & disk cache
+├── icons.rs         # Inline SVG vector icons
+├── style.rs         # YouTube Music dark theme & widget styling
+└── types.rs         # Domain types, settings & formatting helpers
 ```
 
 ---

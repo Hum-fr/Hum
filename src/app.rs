@@ -13,8 +13,8 @@ use crate::auth::{self, GoogleSession};
 use crate::icons;
 use crate::style;
 use crate::types::{
-    CollectionCard, MoodPill, PlaybackState, PlaylistPage, RepeatMode, Shelf, ShelfItem, Track,
-    UserPlaylist, format_time, truncate_text,
+    AppSettings, CollectionCard, MoodPill, PlaybackState, PlaylistPage, RepeatMode, Shelf,
+    ShelfItem, Track, UserPlaylist, format_time, truncate_text,
 };
 use crate::ytmusic::{self, YtmAuth};
 
@@ -28,6 +28,7 @@ pub enum Page {
     Search,
     Library,
     UpNext,
+    Settings,
     Playlist,
     UserPlaylist(usize),
 }
@@ -85,12 +86,20 @@ pub enum Message {
     InstallYtDlp,
     YtDlpInstalled(Result<String, String>),
 
-    // Google OAuth
+    // Google / Account
     OpenSignIn,
     CloseSignIn,
     StartGoogleAuth,
     GoogleAuthFinished(Result<GoogleSession, String>),
+    AccountProfileRefreshed(Option<GoogleSession>),
+    RefreshLibrary,
     SignOut,
+
+    // Settings
+    ToggleDiskCache,
+    SetPrefetchAhead(usize),
+    ClearAudioCache,
+    ClearHistory,
 
     // Custom playlists
     OpenNewPlaylist,
@@ -133,6 +142,8 @@ pub struct Hum {
     loading_page: bool,
     installing_helper: bool,
     has_yt_dlp: bool,
+    settings: AppSettings,
+    cache_stats: (usize, u64),
 
     home_shelves: Vec<Shelf>,
     explore_shelves: Vec<Shelf>,
@@ -173,15 +184,17 @@ impl Hum {
         let client = ytmusic::build_http_client();
         let google_session = auth::load_google_session();
         let ytm_auth = google_session.as_ref().and_then(GoogleSession::ytm_auth);
+        let settings = auth::load_settings();
         let liked_tracks = auth::load_liked_tracks();
         let liked_ids = liked_tracks.iter().map(|t| t.id.clone()).collect();
         let user_playlists = auth::load_user_playlists();
         let history = auth::load_history();
         let has_yt_dlp = ytmusic::find_yt_dlp().is_some();
+        let cache_stats = ytmusic::cache_stats();
 
         let mut app = Self {
             client: client.clone(),
-            audio: AudioEngine::start(),
+            audio: AudioEngine::start(settings.default_volume),
             search_id: Id::new("search_bar"),
             google_session: google_session.clone(),
             show_sign_in: false,
@@ -197,6 +210,8 @@ impl Hum {
             loading_page: true,
             installing_helper: false,
             has_yt_dlp,
+            settings: settings.clone(),
+            cache_stats,
             home_shelves: Vec::new(),
             explore_shelves: Vec::new(),
             browse_shelves: Vec::new(),
@@ -214,8 +229,8 @@ impl Hum {
             position: Duration::ZERO,
             audio_duration: None,
             seeking_to: None,
-            volume: 0.85,
-            muted: false,
+            volume: settings.default_volume,
+            muted: settings.default_volume <= 0.001,
             shuffle: false,
             repeat: RepeatMode::Off,
             play_seq: 0,
@@ -228,24 +243,36 @@ impl Hum {
             prefetching: HashSet::new(),
         };
 
+        let home_client = client.clone();
         let mut tasks = vec![Task::perform(
             async move {
-                ytmusic::fetch_browse_shelves(&client, "FEmusic_home", None, ytm_auth.as_ref())
+                ytmusic::fetch_browse_shelves(&home_client, "FEmusic_home", None, ytm_auth.as_ref())
                     .await
             },
             Message::HomeLoaded,
         )];
 
-        if google_session.is_some() {
+        if let Some(session) = &google_session {
             tasks.push(app.sync_google_library());
+            if session.avatar_url.is_none() && session.ytm_auth().is_some() {
+                let profile_client = client.clone();
+                let profile_session = session.clone();
+                tasks.push(Task::perform(
+                    async move { auth::refresh_account_profile(&profile_client, profile_session).await },
+                    Message::AccountProfileRefreshed,
+                ));
+            }
         }
 
-        let history_thumbs: Vec<String> = app
+        let mut boot_thumbs: Vec<String> = app
             .history
             .iter()
             .filter_map(|t| t.thumb_url.clone())
             .collect();
-        tasks.push(app.fetch_thumbs(history_thumbs));
+        if let Some(avatar) = google_session.as_ref().and_then(|s| s.avatar_url.clone()) {
+            boot_thumbs.push(avatar);
+        }
+        tasks.push(app.fetch_thumbs(boot_thumbs));
 
         (app, Task::batch(tasks))
     }
@@ -385,6 +412,10 @@ impl Hum {
                             },
                             Message::ExploreLoaded,
                         )
+                    }
+                    Page::Settings => {
+                        self.cache_stats = ytmusic::cache_stats();
+                        Task::none()
                     }
                     _ => Task::none(),
                 }
@@ -628,6 +659,8 @@ impl Hum {
                 self.volume = vol;
                 self.muted = vol <= 0.001;
                 self.audio.set_volume(vol);
+                self.settings.default_volume = vol;
+                auth::save_settings(&self.settings);
                 Task::none()
             }
             Message::InstallYtDlp => {
@@ -675,13 +708,28 @@ impl Hum {
                 self.authorizing = false;
                 self.show_sign_in = false;
                 self.status_note = Some(format!("Signed in as {}", session.user_name));
+                let avatar = session.avatar_url.clone().into_iter().collect();
                 self.google_session = Some(session);
-                Task::batch([self.sync_google_library(), self.reload_home()])
+                Task::batch([
+                    self.sync_google_library(),
+                    self.reload_home(),
+                    self.fetch_thumbs(avatar),
+                ])
             }
             Message::GoogleAuthFinished(Err(err)) => {
                 self.authorizing = false;
                 self.auth_error = Some(err);
                 Task::none()
+            }
+            Message::AccountProfileRefreshed(Some(session)) => {
+                let avatar = session.avatar_url.clone().into_iter().collect();
+                self.google_session = Some(session);
+                self.fetch_thumbs(avatar)
+            }
+            Message::AccountProfileRefreshed(None) => Task::none(),
+            Message::RefreshLibrary => {
+                self.status_note = Some("Refreshing library...".into());
+                Task::batch([self.sync_google_library(), self.reload_home()])
             }
             Message::SignOut => {
                 auth::clear_google_session();
@@ -690,6 +738,34 @@ impl Hum {
                 self.show_sign_in = false;
                 self.status_note = Some("Signed out.".into());
                 self.reload_home()
+            }
+            Message::ToggleDiskCache => {
+                self.settings.disk_audio_cache = !self.settings.disk_audio_cache;
+                auth::save_settings(&self.settings);
+                Task::none()
+            }
+            Message::SetPrefetchAhead(count) => {
+                self.settings.prefetch_ahead = count.min(2);
+                auth::save_settings(&self.settings);
+                Task::none()
+            }
+            Message::ClearAudioCache => {
+                match ytmusic::clear_audio_cache() {
+                    Ok(()) => {
+                        self.cache_stats = (0, 0);
+                        self.prefetched_audio.clear();
+                        self.prefetch_order.clear();
+                        self.status_note = Some("Audio cache cleared.".into());
+                    }
+                    Err(e) => self.status_note = Some(e),
+                }
+                Task::none()
+            }
+            Message::ClearHistory => {
+                self.history.clear();
+                auth::save_history(&self.history);
+                self.status_note = Some("Listening history cleared.".into());
+                Task::none()
             }
             Message::OpenNewPlaylist => {
                 self.show_new_playlist = true;
@@ -955,40 +1031,52 @@ impl Hum {
             return self.prefetch_next_track();
         }
 
+        let client = self.client.clone();
         let video_id = track.id.clone();
+        let use_cache = self.settings.disk_audio_cache;
         Task::perform(
-            async move { ytmusic::fetch_track_audio(&video_id).await },
+            async move { ytmusic::fetch_track_audio(&client, &video_id, use_cache).await },
             move |result| Message::AudioReady { seq, track, result },
         )
     }
 
     fn prefetch_next_track(&mut self) -> Task<Message> {
+        self.cache_stats = ytmusic::cache_stats();
+        let ahead = self.settings.prefetch_ahead.min(2);
+        if ahead == 0 {
+            return Task::none();
+        }
         let Some(idx) = self.current_index else {
             return Task::none();
         };
-        let next_idx = if idx + 1 < self.queue.len() {
-            Some(idx + 1)
-        } else if self.repeat == RepeatMode::All && !self.queue.is_empty() {
-            Some(0)
-        } else {
-            None
-        };
-        let Some(next_idx) = next_idx else {
-            return Task::none();
-        };
-        let next_id = self.queue[next_idx].id.clone();
-        if self.prefetched_audio.contains_key(&next_id) || !self.prefetching.insert(next_id.clone())
-        {
-            return Task::none();
+
+        let mut tasks = Vec::new();
+        for offset in 1..=ahead {
+            let next_idx = if idx + offset < self.queue.len() {
+                idx + offset
+            } else if self.repeat == RepeatMode::All && !self.queue.is_empty() {
+                (idx + offset) % self.queue.len()
+            } else {
+                continue;
+            };
+            let next_id = self.queue[next_idx].id.clone();
+            if self.prefetched_audio.contains_key(&next_id)
+                || !self.prefetching.insert(next_id.clone())
+            {
+                continue;
+            }
+            let client = self.client.clone();
+            let use_cache = self.settings.disk_audio_cache;
+            tasks.push(Task::perform(
+                async move {
+                    let res = ytmusic::fetch_track_audio(&client, &next_id, use_cache).await;
+                    (next_id, res)
+                },
+                |(video_id, result)| Message::PrefetchReady { video_id, result },
+            ));
         }
 
-        Task::perform(
-            async move {
-                let res = ytmusic::fetch_track_audio(&next_id).await;
-                (next_id, res)
-            },
-            |(video_id, result)| Message::PrefetchReady { video_id, result },
-        )
+        Task::batch(tasks)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -1111,6 +1199,15 @@ impl Hum {
             None => String::from("Guest mode"),
         };
 
+        let settings_btn = container(
+            self.nav_button(
+                "Settings",
+                Page::Settings,
+                icons::settings(18.0, icon_color(self.page == Page::Settings)).into(),
+            ),
+        )
+        .padding([4, 10]);
+
         container(
             column![
                 brand,
@@ -1120,8 +1217,9 @@ impl Hum {
                 scrollable(playlists_col.padding([8, 10]))
                     .width(Length::Fill)
                     .height(Length::Fill),
+                settings_btn,
                 container(text(account_label).size(11).color(style::TEXT_MUTED))
-                    .padding([12, 18]),
+                    .padding([6, 18]),
             ]
             .width(216)
             .height(Length::Fill),
@@ -1138,6 +1236,7 @@ impl Hum {
             Page::Search => self.view_search_results(),
             Page::Library => self.view_library(),
             Page::UpNext => self.view_up_next(),
+            Page::Settings => self.view_settings(),
             Page::Playlist => self.view_playlist_or_browse(),
             Page::UserPlaylist(idx) => self.view_user_playlist(idx),
         };
@@ -1195,14 +1294,14 @@ impl Hum {
             right_actions = right_actions.push(
                 button(
                     row![
-                        icons::user(14.0, style::TEXT_PRIMARY),
+                        self.render_avatar(session.avatar_url.as_deref(), 20.0, style::TEXT_PRIMARY),
                         text(truncate_text(&session.user_name, 16)).size(12),
                     ]
-                    .spacing(6)
+                    .spacing(8)
                     .align_y(Alignment::Center),
                 )
                 .on_press(Message::OpenSignIn)
-                .padding([7, 14])
+                .padding([5, 12])
                 .style(style::pill_button(false)),
             );
         } else {
@@ -1855,6 +1954,250 @@ impl Hum {
             .into()
     }
 
+    fn view_settings(&self) -> Element<'_, Message> {
+        let account_card = if let Some(session) = &self.google_session {
+            let email_line = session
+                .user_email
+                .as_deref()
+                .unwrap_or("Signed in to YouTube Music");
+            container(
+                row![
+                    self.render_avatar(session.avatar_url.as_deref(), 44.0, style::TEXT_PRIMARY),
+                    column![
+                        text(&session.user_name).size(15).color(style::TEXT_PRIMARY),
+                        text(email_line).size(12).color(style::TEXT_MUTED),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    button(text("Refresh").size(12))
+                        .on_press(Message::RefreshLibrary)
+                        .padding([7, 14])
+                        .style(style::pill_button(false)),
+                    button(text("Sign out").size(12))
+                        .on_press(Message::SignOut)
+                        .padding([7, 14])
+                        .style(style::pill_button(true)),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            )
+            .padding(18)
+            .width(Length::Fill)
+            .style(style::modal_card)
+        } else {
+            container(
+                row![
+                    self.render_avatar(None, 40.0, style::TEXT_MUTED),
+                    column![
+                        text("Not signed in").size(15).color(style::TEXT_PRIMARY),
+                        text("Sign in with Google to sync your YouTube Music feed, playlists, and likes.")
+                            .size(12)
+                            .color(style::TEXT_MUTED),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    button(text("Sign in").size(12))
+                        .on_press(Message::OpenSignIn)
+                        .padding([7, 16])
+                        .style(style::pill_button(true)),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            )
+            .padding(18)
+            .width(Length::Fill)
+            .style(style::modal_card)
+        };
+
+        let engine_status = if ytmusic::has_embedded_yt_dlp() {
+            "Embedded in hum.exe (ready)"
+        } else if self.has_yt_dlp {
+            "Ready"
+        } else {
+            "Not installed"
+        };
+        let update_label = if self.installing_helper {
+            "Updating..."
+        } else if self.has_yt_dlp {
+            "Update yt-dlp"
+        } else {
+            "Install yt-dlp"
+        };
+
+        let (cache_count, cache_bytes) = self.cache_stats;
+        let cache_mb = (cache_bytes as f64) / (1024.0 * 1024.0);
+        let cache_summary = if self.settings.disk_audio_cache {
+            format!("Enabled  •  {cache_count} tracks ({cache_mb:.1} MB cached)")
+        } else {
+            String::from("Disabled  •  streams are not saved to disk")
+        };
+
+        let prefetch_pills = row![
+            button(text("Off").size(12))
+                .on_press(Message::SetPrefetchAhead(0))
+                .padding([6, 12])
+                .style(style::pill_button(self.settings.prefetch_ahead == 0)),
+            button(text("1 track").size(12))
+                .on_press(Message::SetPrefetchAhead(1))
+                .padding([6, 12])
+                .style(style::pill_button(self.settings.prefetch_ahead == 1)),
+            button(text("2 tracks").size(12))
+                .on_press(Message::SetPrefetchAhead(2))
+                .padding([6, 12])
+                .style(style::pill_button(self.settings.prefetch_ahead >= 2)),
+        ]
+        .spacing(8);
+
+        let playback_card = container(
+            column![
+                text("Audio & Playback").size(15).color(style::TEXT_PRIMARY),
+                row![
+                    column![
+                        text("Audio engine (yt-dlp)").size(13).color(style::TEXT_PRIMARY),
+                        text(engine_status).size(12).color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text(update_label).size(12))
+                        .on_press(Message::InstallYtDlp)
+                        .padding([7, 14])
+                        .style(style::pill_button(false)),
+                ]
+                .align_y(Alignment::Center),
+                row![
+                    column![
+                        text("Disk audio cache").size(13).color(style::TEXT_PRIMARY),
+                        text(cache_summary).size(12).color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text(if self.settings.disk_audio_cache { "Turn off" } else { "Turn on" }).size(12))
+                        .on_press(Message::ToggleDiskCache)
+                        .padding([7, 14])
+                        .style(style::pill_button(self.settings.disk_audio_cache)),
+                    button(text("Clear cache").size(12))
+                        .on_press(Message::ClearAudioCache)
+                        .padding([7, 14])
+                        .style(style::pill_button(false)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                row![
+                    column![
+                        text("Prefetch next tracks in queue").size(13).color(style::TEXT_PRIMARY),
+                        text("Preloads upcoming tracks in the background for instant skipping.")
+                            .size(12)
+                            .color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    prefetch_pills,
+                ]
+                .align_y(Alignment::Center),
+                row![
+                    text(format!("Volume: {}%", (self.volume * 100.0).round() as u32))
+                        .size(13)
+                        .color(style::TEXT_PRIMARY)
+                        .width(Length::Fill),
+                    slider(0.0..=1.0, self.volume, Message::VolumeChanged)
+                        .step(0.01_f32)
+                        .width(180)
+                        .style(style::volume_slider),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(16),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::modal_card);
+
+        let data_dir = auth::app_data_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| String::from("%LOCALAPPDATA%\\hum"));
+
+        let data_card = container(
+            column![
+                text("Library & Data").size(15).color(style::TEXT_PRIMARY),
+                row![
+                    column![
+                        text("Listening history").size(13).color(style::TEXT_PRIMARY),
+                        text(format!("{} recently played tracks", self.history.len()))
+                            .size(12)
+                            .color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text("Clear history").size(12))
+                        .on_press(Message::ClearHistory)
+                        .padding([7, 14])
+                        .style(style::pill_button(false)),
+                ]
+                .align_y(Alignment::Center),
+                column![
+                    text("App data folder").size(13).color(style::TEXT_PRIMARY),
+                    text(data_dir).size(12).color(style::TEXT_MUTED),
+                ]
+                .spacing(2),
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::modal_card);
+
+        let shortcuts_card = container(
+            column![
+                text("Keyboard Shortcuts").size(15).color(style::TEXT_PRIMARY),
+                row![text("Space").size(12).color(style::TEXT_PRIMARY).width(140), text("Play / Pause").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+F / Ctrl+K").size(12).color(style::TEXT_PRIMARY).width(140), text("Focus search bar").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+Right").size(12).color(style::TEXT_PRIMARY).width(140), text("Next track").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+Left").size(12).color(style::TEXT_PRIMARY).width(140), text("Previous track / restart").size(12).color(style::TEXT_MUTED)],
+                row![text("Esc").size(12).color(style::TEXT_PRIMARY).width(140), text("Close open modal").size(12).color(style::TEXT_MUTED)],
+            ]
+            .spacing(8),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::modal_card);
+
+        let about_card = container(
+            column![
+                text("About").size(15).color(style::TEXT_PRIMARY),
+                text(format!(
+                    "hum v{}  •  Native YouTube Music desktop client (MIT License)",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .size(12)
+                .color(style::TEXT_MUTED),
+                text("github.com/Hum-fr/Hum  •  hum-fr.github.io")
+                    .size(12)
+                    .color(style::TEXT_MUTED),
+            ]
+            .spacing(6),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::modal_card);
+
+        let content = column![
+            text("Settings").size(26).color(style::TEXT_PRIMARY),
+            account_card,
+            playback_card,
+            data_card,
+            shortcuts_card,
+            about_card,
+        ]
+        .spacing(16)
+        .max_width(820)
+        .padding([24, 28]);
+
+        scrollable(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn view_track_row<'a>(
         &'a self,
         track: &'a Track,
@@ -2109,17 +2452,23 @@ impl Hum {
 
         if let Some(session) = &self.google_session {
             card = card.push(
-                text(format!(
-                    "Connected as {}{}",
-                    session.user_name,
-                    session
-                        .user_email
-                        .as_deref()
-                        .map(|e| format!(" ({e})"))
-                        .unwrap_or_default()
-                ))
-                .size(13)
-                .color(style::TEXT_PRIMARY),
+                row![
+                    self.render_avatar(session.avatar_url.as_deref(), 40.0, style::TEXT_PRIMARY),
+                    column![
+                        text(&session.user_name).size(14).color(style::TEXT_PRIMARY),
+                        text(
+                            session
+                                .user_email
+                                .as_deref()
+                                .unwrap_or("YouTube Music account"),
+                        )
+                        .size(12)
+                        .color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
             );
             card = card.push(
                 row![
@@ -2323,6 +2672,26 @@ impl Hum {
             .center_y(size)
             .style(style::thumb_box)
             .into()
+    }
+
+    fn render_avatar(
+        &self,
+        url: Option<&str>,
+        size: f32,
+        fallback_color: Color,
+    ) -> Element<'_, Message> {
+        if let Some(u) = url
+            && let Some(handle) = self.thumbs.get(u)
+        {
+            return image(handle.clone())
+                .width(size)
+                .height(size)
+                .content_fit(ContentFit::Cover)
+                .border_radius(size / 2.0)
+                .into();
+        }
+
+        icons::user(size * 0.72, fallback_color).into()
     }
 
     fn nav_button<'a>(

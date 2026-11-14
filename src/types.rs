@@ -58,6 +58,24 @@ pub struct UserPlaylist {
     pub tracks: Vec<Track>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    pub default_volume: f32,
+    pub disk_audio_cache: bool,
+    pub prefetch_ahead: usize,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            default_volume: 0.85,
+            disk_audio_cache: true,
+            prefetch_ahead: 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackState {
     Stopped,

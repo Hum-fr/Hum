@@ -88,10 +88,10 @@ async fn post_innertube(
 pub async fn fetch_account_info(
     client: &reqwest::Client,
     auth: &YtmAuth,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     let payload = json!({ "context": client_context() });
     let Ok(body) = post_innertube(client, ACCOUNT_MENU_URL, payload, Some(auth)).await else {
-        return (String::from("YouTube Music"), None);
+        return (String::from("YouTube Music"), None, None);
     };
 
     if let Some(header) = find_key(&body, "activeAccountHeaderRenderer") {
@@ -99,10 +99,16 @@ pub async fn fetch_account_info(
             .unwrap_or_else(|| String::from("YouTube Music"));
         let handle = runs_text(header.pointer("/email/runs"))
             .or_else(|| runs_text(header.pointer("/channelHandle/runs")));
-        return (name, handle);
+        let avatar = pick_thumbnail(
+            header
+                .pointer("/accountPhoto/thumbnails")
+                .and_then(|v| v.as_array()),
+            96,
+        );
+        return (name, handle, avatar);
     }
 
-    (String::from("YouTube Music"), None)
+    (String::from("YouTube Music"), None, None)
 }
 
 fn find_key<'a>(val: &'a Value, target: &str) -> Option<&'a Value> {
@@ -611,6 +617,50 @@ fn pick_thumbnail(thumbs: Option<&Vec<Value>>, target_width: u64) -> Option<Stri
     Some(best.0.to_string())
 }
 
+#[cfg(has_embedded_yt_dlp)]
+const EMBEDDED_YT_DLP: &[u8] = include_bytes!(env!("HUM_EMBED_YT_DLP_PATH"));
+
+const AUDIO_FORMAT_SPEC: &str = "140/bestaudio[ext=m4a][protocol^=https]/bestaudio[ext=mp4][protocol^=https]/bestaudio[ext=mp3]/bestaudio[protocol^=https]";
+const MAX_DISK_CACHE_BYTES: u64 = 300 * 1024 * 1024;
+
+pub fn has_embedded_yt_dlp() -> bool {
+    cfg!(has_embedded_yt_dlp)
+}
+
+fn ensure_embedded_yt_dlp() -> Option<PathBuf> {
+    #[cfg(has_embedded_yt_dlp)]
+    {
+        let dest = local_yt_dlp_path()?;
+        let parent = dest.parent()?;
+        let ver_path = parent.join("yt-dlp.embedded.ver");
+        let pkg_ver = env!("CARGO_PKG_VERSION");
+
+        let up_to_date = dest.is_file()
+            && std::fs::read_to_string(&ver_path)
+                .map(|s| s.trim() == pkg_ver)
+                .unwrap_or(false);
+        if up_to_date {
+            return Some(dest);
+        }
+
+        if std::fs::create_dir_all(parent).is_ok() {
+            let tmp = dest.with_extension("tmp");
+            if std::fs::write(&tmp, EMBEDDED_YT_DLP).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+                }
+                if std::fs::rename(&tmp, &dest).is_ok() {
+                    let _ = std::fs::write(&ver_path, pkg_ver);
+                    return Some(dest);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn find_yt_dlp() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
@@ -625,6 +675,10 @@ pub fn find_yt_dlp() -> Option<PathBuf> {
         && local_bin.is_file()
     {
         return Some(local_bin);
+    }
+
+    if let Some(embedded) = ensure_embedded_yt_dlp() {
+        return Some(embedded);
     }
 
     let path_var = std::env::var_os("PATH")?;
@@ -642,6 +696,83 @@ pub fn find_yt_dlp() -> Option<PathBuf> {
 fn local_yt_dlp_path() -> Option<PathBuf> {
     let bin_name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
     Some(app_data_dir()?.join(bin_name))
+}
+
+pub fn audio_cache_dir() -> Option<PathBuf> {
+    Some(app_data_dir()?.join("audio_cache"))
+}
+
+fn cache_file_path(video_id: &str) -> Option<PathBuf> {
+    let safe: String = video_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe.is_empty() {
+        return None;
+    }
+    Some(audio_cache_dir()?.join(format!("{safe}.aud")))
+}
+
+pub fn cache_stats() -> (usize, u64) {
+    let Some(dir) = audio_cache_dir() else {
+        return (0, 0);
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut count = 0usize;
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            count += 1;
+            total += meta.len();
+        }
+    }
+    (count, total)
+}
+
+pub fn clear_audio_cache() -> Result<(), String> {
+    let Some(dir) = audio_cache_dir() else {
+        return Ok(());
+    };
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("Failed clearing cache: {e}"))?;
+    }
+    Ok(())
+}
+
+fn trim_audio_cache(dir: &PathBuf) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            Some((e.path(), meta.len(), modified))
+        })
+        .collect();
+
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= MAX_DISK_CACHE_BYTES {
+        return;
+    }
+
+    files.sort_by_key(|(_, _, modified)| *modified);
+    for (path, len, _) in files {
+        if total <= MAX_DISK_CACHE_BYTES {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 pub async fn install_yt_dlp(client: &reqwest::Client) -> Result<PathBuf, String> {
@@ -683,20 +814,120 @@ pub async fn install_yt_dlp(client: &reqwest::Client) -> Result<PathBuf, String>
     Ok(dest)
 }
 
-pub async fn fetch_track_audio(video_id: &str) -> Result<Vec<u8>, String> {
+pub async fn fetch_track_audio(
+    client: &reqwest::Client,
+    video_id: &str,
+    use_cache: bool,
+) -> Result<Vec<u8>, String> {
+    if use_cache
+        && let Some(path) = cache_file_path(video_id)
+        && let Ok(bytes) = tokio::fs::read(&path).await
+        && !bytes.is_empty()
+    {
+        return Ok(bytes);
+    }
+
     let yt_dlp = find_yt_dlp().ok_or_else(|| {
         String::from("yt-dlp not found. Click Setup audio in the top bar.")
     })?;
 
-    match run_yt_dlp_audio(&yt_dlp, video_id, None).await {
-        Ok(bytes) => Ok(bytes),
-        Err(first_err) => {
-            // Retry with mobile player clients if default extraction hits a snag.
-            run_yt_dlp_audio(&yt_dlp, video_id, Some("youtube:player_client=android_vr,ios,web"))
+    // Fast path: ask yt-dlp for the direct stream URL and download in native Rust over HTTP/2.
+    let bytes = match fetch_direct_via_yt_dlp(client, &yt_dlp, video_id).await {
+        Ok(b) => b,
+        Err(_) => match run_yt_dlp_audio(&yt_dlp, video_id, Some("youtube:player_client=android_vr,ios,web")).await {
+            Ok(b) => b,
+            Err(first_err) => run_yt_dlp_audio(&yt_dlp, video_id, None)
                 .await
-                .map_err(|_| first_err)
+                .map_err(|_| first_err)?,
+        },
+    };
+
+    if use_cache && let Some(path) = cache_file_path(video_id) {
+        let write_bytes = bytes.clone();
+        tokio::spawn(async move {
+            if let Some(dir) = path.parent() {
+                let _ = tokio::fs::create_dir_all(dir).await;
+                let tmp = path.with_extension("tmp");
+                if tokio::fs::write(&tmp, &write_bytes).await.is_ok() {
+                    let _ = tokio::fs::rename(&tmp, &path).await;
+                }
+                let dir_buf = dir.to_path_buf();
+                let _ = tokio::task::spawn_blocking(move || trim_audio_cache(&dir_buf)).await;
+            }
+        });
+    }
+
+    Ok(bytes)
+}
+
+async fn fetch_direct_via_yt_dlp(
+    client: &reqwest::Client,
+    yt_dlp: &PathBuf,
+    video_id: &str,
+) -> Result<Vec<u8>, String> {
+    let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
+    let mut cmd = Command::new(yt_dlp);
+    cmd.args([
+        "-f",
+        AUDIO_FORMAT_SPEC,
+        "--no-playlist",
+        "--no-warnings",
+        "--extractor-args",
+        "youtube:player_client=android_vr,ios,web",
+        "-j",
+        &watch_url,
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed starting yt-dlp: {e}"))?;
+
+    if !out.status.success() {
+        return Err(String::from("yt-dlp -j failed"));
+    }
+
+    let meta: Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("Invalid yt-dlp JSON: {e}"))?;
+    let stream_url = meta
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("http"))
+        .ok_or_else(|| String::from("No direct stream URL"))?;
+
+    let mut req = client.get(stream_url);
+    if let Some(headers) = meta.get("http_headers").and_then(|v| v.as_object()) {
+        for (k, v) in headers {
+            if let Some(val) = v.as_str() {
+                req = req.header(k.as_str(), val);
+            }
         }
     }
+
+    let res = req
+        .send()
+        .await
+        .map_err(|e| format!("Direct stream request failed: {e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("Direct stream returned HTTP {}", res.status()));
+    }
+
+    let bytes = res
+        .bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("Failed reading stream: {e}"))?;
+
+    if bytes.is_empty() {
+        return Err(String::from("Direct stream returned empty body"));
+    }
+
+    Ok(bytes)
 }
 
 async fn run_yt_dlp_audio(
@@ -708,7 +939,7 @@ async fn run_yt_dlp_audio(
     let mut cmd = Command::new(yt_dlp);
     cmd.args([
         "-f",
-        "140/bestaudio[ext=m4a][protocol^=https]/bestaudio[ext=mp4][protocol^=https]/bestaudio[ext=mp3]/bestaudio[protocol^=https]",
+        AUDIO_FORMAT_SPEC,
         "--no-playlist",
         "--no-warnings",
     ]);
@@ -856,8 +1087,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits live yt-dlp and decodes audio"]
     async fn live_playback_smoke() {
+        let client = build_http_client();
         for id in ["khnokW3Mw24", "5At0aMBsSSE"] {
-            let bytes = fetch_track_audio(id)
+            let bytes = fetch_track_audio(&client, id, false)
                 .await
                 .expect("fetch_track_audio failed");
             println!("{id}: Downloaded bytes: {}", bytes.len());

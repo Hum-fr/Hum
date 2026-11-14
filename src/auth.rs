@@ -52,6 +52,8 @@ pub struct GoogleSession {
     pub user_name: String,
     pub user_email: Option<String>,
     #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default)]
     pub cookie_header: Option<String>,
     #[serde(default)]
     pub sapisid: Option<String>,
@@ -125,7 +127,7 @@ pub async fn sign_in_with_webview(client: &reqwest::Client) -> Result<GoogleSess
         cookie_header: payload.cookie_header.clone(),
         sapisid: payload.sapisid.clone(),
     };
-    let (user_name, user_email) = ytmusic::fetch_account_info(client, &ytm_auth).await;
+    let (user_name, user_email, avatar_url) = ytmusic::fetch_account_info(client, &ytm_auth).await;
 
     let session = GoogleSession {
         access_token: String::new(),
@@ -133,12 +135,32 @@ pub async fn sign_in_with_webview(client: &reqwest::Client) -> Result<GoogleSess
         expires_at: 0,
         user_name,
         user_email,
+        avatar_url,
         cookie_header: Some(payload.cookie_header),
         sapisid: Some(payload.sapisid),
     };
 
     save_google_session(&session)?;
     Ok(session)
+}
+
+pub async fn refresh_account_profile(
+    client: &reqwest::Client,
+    mut session: GoogleSession,
+) -> Option<GoogleSession> {
+    let auth = session.ytm_auth()?;
+    let (name, email, avatar) = ytmusic::fetch_account_info(client, &auth).await;
+    if name != "YouTube Music" {
+        session.user_name = name;
+    }
+    if email.is_some() {
+        session.user_email = email;
+    }
+    if avatar.is_some() {
+        session.avatar_url = avatar;
+    }
+    let _ = save_google_session(&session);
+    Some(session)
 }
 
 pub async fn fetch_ytm_playlists(
@@ -422,6 +444,14 @@ pub fn load_history() -> Vec<Track> {
 
 pub fn save_history(tracks: &[Track]) {
     save_json_file("history.json", tracks);
+}
+
+pub fn load_settings() -> crate::types::AppSettings {
+    load_json_file("settings.json")
+}
+
+pub fn save_settings(settings: &crate::types::AppSettings) {
+    save_json_file("settings.json", settings);
 }
 
 fn load_json_file<T: for<'de> Deserialize<'de> + Default>(name: &str) -> T {
