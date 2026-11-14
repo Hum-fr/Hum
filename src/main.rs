@@ -6,6 +6,7 @@ mod auth;
 mod icons;
 mod style;
 mod types;
+mod webview_login;
 mod ytmusic;
 
 use iced::{Size, window};
@@ -13,6 +14,10 @@ use iced::{Size, window};
 use app::Hum;
 
 fn main() -> iced::Result {
+    if let Some(out_path) = webview_login::signin_arg() {
+        std::process::exit(webview_login::run_signin_window(&out_path));
+    }
+
     iced::application(Hum::boot, Hum::update, Hum::view)
         .title(Hum::title)
         .subscription(Hum::subscription)

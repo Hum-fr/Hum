@@ -9,14 +9,14 @@ use iced::widget::{
 use iced::{Alignment, Background, Color, ContentFit, Element, Length, Subscription, Task, Theme};
 
 use crate::audio::AudioEngine;
-use crate::auth::{self, GoogleOAuthConfig, GoogleSession};
+use crate::auth::{self, GoogleSession};
 use crate::icons;
 use crate::style;
 use crate::types::{
     CollectionCard, MoodPill, PlaybackState, PlaylistPage, RepeatMode, Shelf, ShelfItem, Track,
     UserPlaylist, format_time, truncate_text,
 };
-use crate::ytmusic;
+use crate::ytmusic::{self, YtmAuth};
 
 const MAX_CACHED_THUMBS: usize = 400;
 const MAX_HISTORY: usize = 40;
@@ -118,7 +118,6 @@ pub struct Hum {
     search_id: Id,
 
     google_session: Option<GoogleSession>,
-    oauth_config: Option<GoogleOAuthConfig>,
     show_sign_in: bool,
     authorizing: bool,
     auth_error: Option<String>,
@@ -173,7 +172,7 @@ impl Hum {
     pub fn boot() -> (Self, Task<Message>) {
         let client = ytmusic::build_http_client();
         let google_session = auth::load_google_session();
-        let oauth_config = GoogleOAuthConfig::load();
+        let ytm_auth = google_session.as_ref().and_then(GoogleSession::ytm_auth);
         let liked_tracks = auth::load_liked_tracks();
         let liked_ids = liked_tracks.iter().map(|t| t.id.clone()).collect();
         let user_playlists = auth::load_user_playlists();
@@ -185,7 +184,6 @@ impl Hum {
             audio: AudioEngine::start(),
             search_id: Id::new("search_bar"),
             google_session: google_session.clone(),
-            oauth_config,
             show_sign_in: false,
             authorizing: false,
             auth_error: None,
@@ -231,7 +229,10 @@ impl Hum {
         };
 
         let mut tasks = vec![Task::perform(
-            async move { ytmusic::fetch_browse_shelves(&client, "FEmusic_home", None).await },
+            async move {
+                ytmusic::fetch_browse_shelves(&client, "FEmusic_home", None, ytm_auth.as_ref())
+                    .await
+            },
             Message::HomeLoaded,
         )];
 
@@ -285,8 +286,9 @@ impl Hum {
                 self.status_note = None;
 
                 let client = self.client.clone();
+                let auth = self.current_ytm_auth();
                 Task::perform(
-                    async move { ytmusic::search_all(&client, &query).await },
+                    async move { ytmusic::search_all(&client, &query, auth.as_ref()).await },
                     Message::SearchFinished,
                 )
             }
@@ -353,9 +355,16 @@ impl Hum {
                     Page::Home if self.home_shelves.is_empty() => {
                         self.loading_page = true;
                         let client = self.client.clone();
+                        let auth = self.current_ytm_auth();
                         Task::perform(
                             async move {
-                                ytmusic::fetch_browse_shelves(&client, "FEmusic_home", None).await
+                                ytmusic::fetch_browse_shelves(
+                                    &client,
+                                    "FEmusic_home",
+                                    None,
+                                    auth.as_ref(),
+                                )
+                                .await
                             },
                             Message::HomeLoaded,
                         )
@@ -363,10 +372,16 @@ impl Hum {
                     Page::Explore if self.explore_shelves.is_empty() => {
                         self.loading_page = true;
                         let client = self.client.clone();
+                        let auth = self.current_ytm_auth();
                         Task::perform(
                             async move {
-                                ytmusic::fetch_browse_shelves(&client, "FEmusic_explore", None)
-                                    .await
+                                ytmusic::fetch_browse_shelves(
+                                    &client,
+                                    "FEmusic_explore",
+                                    None,
+                                    auth.as_ref(),
+                                )
+                                .await
                             },
                             Message::ExploreLoaded,
                         )
@@ -384,6 +399,7 @@ impl Hum {
                 }
                 self.loading_page = true;
                 let client = self.client.clone();
+                let auth = self.current_ytm_auth();
 
                 if as_shelves {
                     self.page = Page::Playlist;
@@ -391,8 +407,13 @@ impl Hum {
                     self.browse_shelves.clear();
                     Task::perform(
                         async move {
-                            ytmusic::fetch_browse_shelves(&client, &browse_id, params.as_deref())
-                                .await
+                            ytmusic::fetch_browse_shelves(
+                                &client,
+                                &browse_id,
+                                params.as_deref(),
+                                auth.as_ref(),
+                            )
+                            .await
                         },
                         Message::BrowseShelvesLoaded,
                     )
@@ -402,7 +423,13 @@ impl Hum {
                     self.browse_shelves.clear();
                     Task::perform(
                         async move {
-                            ytmusic::fetch_playlist(&client, &browse_id, params.as_deref()).await
+                            ytmusic::fetch_playlist(
+                                &client,
+                                &browse_id,
+                                params.as_deref(),
+                                auth.as_ref(),
+                            )
+                            .await
                         },
                         Message::PlaylistLoaded,
                     )
@@ -633,6 +660,9 @@ impl Hum {
             Message::OpenSignIn => {
                 self.show_sign_in = true;
                 self.auth_error = None;
+                if self.google_session.is_none() && !self.authorizing {
+                    return self.start_sign_in();
+                }
                 Task::none()
             }
             Message::CloseSignIn => {
@@ -640,31 +670,13 @@ impl Hum {
                 self.auth_error = None;
                 Task::none()
             }
-            Message::StartGoogleAuth => {
-                if self.authorizing {
-                    return Task::none();
-                }
-                let Some(cfg) = self.oauth_config.clone() else {
-                    self.auth_error = Some(
-                        "Google Sign-In is not configured in this local build (HUM_GOOGLE_CLIENT_ID not set).".into(),
-                    );
-                    return Task::none();
-                };
-                self.authorizing = true;
-                self.auth_error = None;
-
-                let client = self.client.clone();
-                Task::perform(
-                    async move { auth::authorize_with_google(&client, &cfg).await },
-                    Message::GoogleAuthFinished,
-                )
-            }
+            Message::StartGoogleAuth => self.start_sign_in(),
             Message::GoogleAuthFinished(Ok(session)) => {
                 self.authorizing = false;
                 self.show_sign_in = false;
                 self.status_note = Some(format!("Signed in as {}", session.user_name));
                 self.google_session = Some(session);
-                self.sync_google_library()
+                Task::batch([self.sync_google_library(), self.reload_home()])
             }
             Message::GoogleAuthFinished(Err(err)) => {
                 self.authorizing = false;
@@ -677,7 +689,7 @@ impl Hum {
                 self.google_playlists.clear();
                 self.show_sign_in = false;
                 self.status_note = Some("Signed out.".into());
-                Task::none()
+                self.reload_home()
             }
             Message::OpenNewPlaylist => {
                 self.show_new_playlist = true;
@@ -836,6 +848,34 @@ impl Hum {
         Task::none()
     }
 
+    fn current_ytm_auth(&self) -> Option<YtmAuth> {
+        self.google_session.as_ref().and_then(GoogleSession::ytm_auth)
+    }
+
+    fn start_sign_in(&mut self) -> Task<Message> {
+        if self.authorizing {
+            return Task::none();
+        }
+        self.authorizing = true;
+        self.auth_error = None;
+        let client = self.client.clone();
+        Task::perform(
+            async move { auth::sign_in_with_webview(&client).await },
+            Message::GoogleAuthFinished,
+        )
+    }
+
+    fn reload_home(&mut self) -> Task<Message> {
+        let client = self.client.clone();
+        let auth = self.current_ytm_auth();
+        Task::perform(
+            async move {
+                ytmusic::fetch_browse_shelves(&client, "FEmusic_home", None, auth.as_ref()).await
+            },
+            Message::HomeLoaded,
+        )
+    }
+
     fn sync_google_library(&mut self) -> Task<Message> {
         let Some(mut session) = self.google_session.clone() else {
             return Task::none();
@@ -843,6 +883,12 @@ impl Hum {
         let client = self.client.clone();
         Task::perform(
             async move {
+                if let Some(ytm_auth) = session.ytm_auth() {
+                    return tokio::join!(
+                        auth::fetch_ytm_playlists(&client, &ytm_auth),
+                        auth::fetch_ytm_liked_tracks(&client, &ytm_auth),
+                    );
+                }
                 let token = match auth::ensure_valid_token(&client, &mut session).await {
                     Ok(t) => t,
                     Err(e) => {
@@ -2052,10 +2098,10 @@ impl Hum {
 
     fn view_sign_in_modal(&self) -> Element<'_, Message> {
         let mut card = column![
-            text("Authorize with Google")
+            text("Sign in to YouTube Music")
                 .size(19)
                 .color(style::TEXT_PRIMARY),
-            text("Sign in using Google OAuth 2.0 in your browser to sync your Google playlists and liked music.")
+            text("Sign in with Google to sync your YouTube Music home feed, playlists, and liked songs.")
                 .size(13)
                 .color(style::TEXT_SECONDARY),
         ]
@@ -2089,47 +2135,43 @@ impl Hum {
                 ]
                 .spacing(10),
             );
-        } else if self.oauth_config.is_some() {
+        } else {
             if let Some(err) = &self.auth_error {
                 card = card.push(text(err).size(12).color(style::YT_RED));
             }
 
-            let btn_label = if self.authorizing {
-                "Waiting for Google in browser..."
+            if self.authorizing {
+                card = card.push(
+                    text("Finish signing in in the window that opened.")
+                        .size(13)
+                        .color(style::TEXT_MUTED),
+                );
+                card = card.push(
+                    row![
+                        space::horizontal().width(Length::Fill),
+                        button(text("Close").size(13))
+                            .on_press(Message::CloseSignIn)
+                            .padding([8, 16])
+                            .style(style::pill_button(false)),
+                    ]
+                    .spacing(10),
+                );
             } else {
-                "Continue with Google"
-            };
-
-            card = card.push(
-                row![
-                    space::horizontal().width(Length::Fill),
-                    button(text("Cancel").size(13))
-                        .on_press(Message::CloseSignIn)
-                        .padding([8, 16])
-                        .style(style::pill_button(false)),
-                    button(text(btn_label).size(13))
-                        .on_press(Message::StartGoogleAuth)
-                        .padding([8, 18])
-                        .style(style::pill_button(true)),
-                ]
-                .spacing(10),
-            );
-        } else {
-            card = card.push(
-                text("This build wasn't compiled with an OAuth client (HUM_GOOGLE_CLIENT_ID). Guest mode still gives you full search, playback, liked music, and local playlists.")
-                    .size(12)
-                    .color(style::TEXT_MUTED),
-            );
-            card = card.push(
-                row![
-                    space::horizontal().width(Length::Fill),
-                    button(text("Close").size(13))
-                        .on_press(Message::CloseSignIn)
-                        .padding([8, 16])
-                        .style(style::pill_button(true)),
-                ]
-                .spacing(10),
-            );
+                card = card.push(
+                    row![
+                        space::horizontal().width(Length::Fill),
+                        button(text("Cancel").size(13))
+                            .on_press(Message::CloseSignIn)
+                            .padding([8, 16])
+                            .style(style::pill_button(false)),
+                        button(text("Sign in with Google").size(13))
+                            .on_press(Message::StartGoogleAuth)
+                            .padding([8, 18])
+                            .style(style::pill_button(true)),
+                    ]
+                    .spacing(10),
+                );
+            }
         }
 
         let modal = container(card)

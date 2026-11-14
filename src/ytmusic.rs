@@ -7,16 +7,24 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::auth::app_data_dir;
+use crate::auth::{app_data_dir, sapisid_auth_header};
 use crate::types::{
     CollectionCard, MoodPill, PlaylistPage, Shelf, ShelfItem, Track, parse_duration_secs,
 };
 
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const BROWSE_URL: &str = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false";
+const ACCOUNT_MENU_URL: &str =
+    "https://music.youtube.com/youtubei/v1/account/account_menu?prettyPrint=false";
 const SONGS_PARAM: &str = "EgWKAQIIAWoMEAMQBBAJEAoQBRAR";
 const PLAYLISTS_PARAM: &str = "EgWKAQIoAWoMEAMQBBAJEAoQBRAR";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+#[derive(Debug, Clone)]
+pub struct YtmAuth {
+    pub cookie_header: String,
+    pub sapisid: String,
+}
 
 static THUMB_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(6));
 
@@ -47,11 +55,22 @@ async fn post_innertube(
     client: &reqwest::Client,
     url: &str,
     payload: Value,
+    auth: Option<&YtmAuth>,
 ) -> Result<Value, String> {
-    let res = client
+    let mut req = client
         .post(url)
         .header("Origin", "https://music.youtube.com")
-        .header("Referer", "https://music.youtube.com/")
+        .header("Referer", "https://music.youtube.com/");
+
+    if let Some(a) = auth {
+        req = req
+            .header("Cookie", &a.cookie_header)
+            .header("Authorization", sapisid_auth_header(&a.sapisid))
+            .header("X-Origin", "https://music.youtube.com")
+            .header("X-Goog-AuthUser", "0");
+    }
+
+    let res = req
         .json(&payload)
         .send()
         .await
@@ -66,9 +85,48 @@ async fn post_innertube(
         .map_err(|e| format!("Failed reading response JSON: {e}"))
 }
 
+pub async fn fetch_account_info(
+    client: &reqwest::Client,
+    auth: &YtmAuth,
+) -> (String, Option<String>) {
+    let payload = json!({ "context": client_context() });
+    let Ok(body) = post_innertube(client, ACCOUNT_MENU_URL, payload, Some(auth)).await else {
+        return (String::from("YouTube Music"), None);
+    };
+
+    if let Some(header) = find_key(&body, "activeAccountHeaderRenderer") {
+        let name = runs_text(header.pointer("/accountName/runs"))
+            .unwrap_or_else(|| String::from("YouTube Music"));
+        let handle = runs_text(header.pointer("/email/runs"))
+            .or_else(|| runs_text(header.pointer("/channelHandle/runs")));
+        return (name, handle);
+    }
+
+    (String::from("YouTube Music"), None)
+}
+
+fn find_key<'a>(val: &'a Value, target: &str) -> Option<&'a Value> {
+    match val {
+        Value::Object(map) => {
+            if let Some(found) = map.get(target) {
+                return Some(found);
+            }
+            for child in map.values() {
+                if let Some(found) = find_key(child, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(|child| find_key(child, target)),
+        _ => None,
+    }
+}
+
 pub async fn search_all(
     client: &reqwest::Client,
     query: &str,
+    auth: Option<&YtmAuth>,
 ) -> Result<(Vec<Track>, Vec<CollectionCard>), String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -87,8 +145,8 @@ pub async fn search_all(
     });
 
     let (songs_res, playlists_res) = tokio::join!(
-        post_innertube(client, SEARCH_URL, songs_payload),
-        post_innertube(client, SEARCH_URL, playlists_payload),
+        post_innertube(client, SEARCH_URL, songs_payload, auth),
+        post_innertube(client, SEARCH_URL, playlists_payload, auth),
     );
 
     let tracks = parse_search_results(&songs_res?);
@@ -103,6 +161,7 @@ pub async fn fetch_browse_shelves(
     client: &reqwest::Client,
     browse_id: &str,
     params: Option<&str>,
+    auth: Option<&YtmAuth>,
 ) -> Result<Vec<Shelf>, String> {
     let mut payload = json!({
         "context": client_context(),
@@ -112,7 +171,7 @@ pub async fn fetch_browse_shelves(
         payload["params"] = json!(p);
     }
 
-    let body = post_innertube(client, BROWSE_URL, payload).await?;
+    let body = post_innertube(client, BROWSE_URL, payload, auth).await?;
     Ok(parse_browse_shelves(&body))
 }
 
@@ -120,6 +179,7 @@ pub async fn fetch_playlist(
     client: &reqwest::Client,
     browse_id: &str,
     params: Option<&str>,
+    auth: Option<&YtmAuth>,
 ) -> Result<PlaylistPage, String> {
     let mut payload = json!({
         "context": client_context(),
@@ -129,7 +189,7 @@ pub async fn fetch_playlist(
         payload["params"] = json!(p);
     }
 
-    let body = post_innertube(client, BROWSE_URL, payload).await?;
+    let body = post_innertube(client, BROWSE_URL, payload, auth).await?;
     Ok(parse_playlist_page(&body))
 }
 
@@ -783,7 +843,7 @@ mod tests {
     #[ignore = "hits live music.youtube.com"]
     async fn live_search_smoke() {
         let client = build_http_client();
-        let (tracks, _) = search_all(&client, "daft punk instant crush")
+        let (tracks, _) = search_all(&client, "daft punk instant crush", None)
             .await
             .unwrap();
         assert!(!tracks.is_empty(), "expected non-empty live search results");
