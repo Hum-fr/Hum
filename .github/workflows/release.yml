@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        env:
+          HUM_GOOGLE_CLIENT_ID: ${{ secrets.HUM_GOOGLE_CLIENT_ID }}
+          HUM_GOOGLE_CLIENT_SECRET: ${{ secrets.HUM_GOOGLE_CLIENT_SECRET }}
+        run: cargo build --release
+
+      - name: Package Windows release with yt-dlp
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\hum.exe dist\hum.exe
+          Copy-Item LICENSE dist\LICENSE
+          Copy-Item README.md dist\README.md
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile "dist\yt-dlp.exe"
+          Compress-Archive -Path dist\* -DestinationPath hum-windows-x86_64.zip -Force
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hum-windows-x86_64.zip
