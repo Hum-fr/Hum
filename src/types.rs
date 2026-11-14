@@ -45,6 +45,19 @@ pub enum SearchSuggestion {
 }
 
 #[derive(Debug, Clone)]
+pub struct LyricLine {
+    pub time_ms: Option<u64>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackLyrics {
+    pub lines: Vec<LyricLine>,
+    pub synced: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Shelf {
     pub title: String,
     pub items: Vec<ShelfItem>,

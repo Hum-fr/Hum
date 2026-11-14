@@ -18,7 +18,8 @@ use crate::icons;
 use crate::style;
 use crate::types::{
     AppSettings, CollectionCard, MoodPill, PlaybackState, PlaylistPage, RepeatMode,
-    SearchSuggestion, Shelf, ShelfItem, Track, UserPlaylist, format_time, truncate_text,
+    SearchSuggestion, Shelf, ShelfItem, Track, TrackLyrics, UserPlaylist, format_time,
+    truncate_text,
 };
 use crate::updater::{self, UpdateInfo};
 use crate::ytmusic::{self, YtmAuth};
@@ -36,6 +37,12 @@ pub enum Page {
     Settings,
     Playlist,
     UserPlaylist(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpNextTab {
+    Queue,
+    Lyrics,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +150,15 @@ pub enum Message {
     OpenUpdatePage,
     DismissUpdateModal,
 
+    // Live lyrics
+    SetUpNextTab(UpNextTab),
+    OpenLyricsPage,
+    LyricsLoaded {
+        track_id: String,
+        result: Result<TrackLyrics, String>,
+    },
+    SeekToMs(u64),
+
     KeyEvent(keyboard::Event),
     Tick,
 }
@@ -204,6 +220,11 @@ pub struct Hum {
     checking_update: bool,
     updating_app: bool,
     update_error: Option<String>,
+    up_next_tab: UpNextTab,
+    lyrics_scroll_id: Id,
+    lyrics_cache: HashMap<String, Result<TrackLyrics, String>>,
+    lyrics_loading: bool,
+    last_active_lyric: Option<usize>,
 
     thumbs: HashMap<String, image::Handle>,
     thumb_order: VecDeque<String>,
@@ -277,6 +298,11 @@ impl Hum {
             checking_update: false,
             updating_app: false,
             update_error: None,
+            up_next_tab: UpNextTab::Queue,
+            lyrics_scroll_id: Id::new("lyrics_scroll"),
+            lyrics_cache: HashMap::new(),
+            lyrics_loading: false,
+            last_active_lyric: None,
             thumbs: HashMap::new(),
             thumb_order: VecDeque::new(),
             thumb_pending: HashSet::new(),
@@ -1023,6 +1049,56 @@ impl Hum {
                 self.show_update_modal = false;
                 Task::none()
             }
+            Message::SetUpNextTab(tab) => {
+                self.up_next_tab = tab;
+                self.last_active_lyric = None;
+                if tab == UpNextTab::Lyrics
+                    && let Some(track) = self.now_playing.clone()
+                {
+                    let fetch_task = self.fetch_lyrics_for(&track);
+                    let scroll_task = self.sync_lyrics_scroll();
+                    return Task::batch([fetch_task, scroll_task]);
+                }
+                Task::none()
+            }
+            Message::OpenLyricsPage => {
+                self.hide_suggestions();
+                if self.page == Page::UpNext && self.up_next_tab == UpNextTab::Lyrics {
+                    self.page = self.prev_page;
+                    return Task::none();
+                }
+                if !matches!(self.page, Page::Playlist | Page::UpNext) {
+                    self.prev_page = self.page;
+                }
+                self.page = Page::UpNext;
+                self.up_next_tab = UpNextTab::Lyrics;
+                self.last_active_lyric = None;
+                if let Some(track) = self.now_playing.clone() {
+                    let fetch_task = self.fetch_lyrics_for(&track);
+                    let scroll_task = self.sync_lyrics_scroll();
+                    return Task::batch([fetch_task, scroll_task]);
+                }
+                Task::none()
+            }
+            Message::LyricsLoaded { track_id, result } => {
+                if self.lyrics_cache.len() > 60 {
+                    self.lyrics_cache.clear();
+                }
+                self.lyrics_cache.insert(track_id.clone(), result);
+                if self.now_playing.as_ref().is_some_and(|t| t.id == track_id) {
+                    self.lyrics_loading = false;
+                    self.last_active_lyric = None;
+                    return self.sync_lyrics_scroll();
+                }
+                Task::none()
+            }
+            Message::SeekToMs(ms) => {
+                let target = Duration::from_millis(ms);
+                self.position = target;
+                self.audio.seek(target);
+                self.last_active_lyric = None;
+                self.sync_lyrics_scroll()
+            }
             Message::Tick => {
                 let snap = self.audio.take_snapshot();
                 if snap.seq != self.play_seq {
@@ -1051,7 +1127,7 @@ impl Hum {
                     return self.advance_next(false);
                 }
 
-                Task::none()
+                self.sync_lyrics_scroll()
             }
         }
     }
@@ -1238,19 +1314,77 @@ impl Hum {
         self.history.truncate(MAX_HISTORY);
         auth::save_history(&self.history);
 
+        self.last_active_lyric = None;
+        let lyrics_task = self.fetch_lyrics_for(&track);
+
         if let Some(bytes) = self.prefetched_audio.remove(&track.id) {
             self.now_playing = Some(track);
             self.playback = PlaybackState::Loading;
             self.audio.play_bytes(seq, bytes);
-            return self.prefetch_next_track();
+            return Task::batch([self.prefetch_next_track(), lyrics_task]);
         }
 
         let client = self.client.clone();
         let video_id = track.id.clone();
         let use_cache = self.settings.disk_audio_cache;
-        Task::perform(
+        let audio_task = Task::perform(
             async move { ytmusic::fetch_track_audio(&client, &video_id, use_cache).await },
             move |result| Message::AudioReady { seq, track, result },
+        );
+        Task::batch([audio_task, lyrics_task])
+    }
+
+    fn fetch_lyrics_for(&mut self, track: &Track) -> Task<Message> {
+        if self.lyrics_cache.contains_key(&track.id) {
+            self.lyrics_loading = false;
+            return Task::none();
+        }
+        self.lyrics_loading = true;
+        let client = self.client.clone();
+        let track_clone = track.clone();
+        let auth = self.current_ytm_auth();
+        let track_id = track.id.clone();
+        Task::perform(
+            async move { ytmusic::fetch_track_lyrics(&client, &track_clone, auth.as_ref()).await },
+            move |result| Message::LyricsLoaded { track_id, result },
+        )
+    }
+
+    fn current_lyric_index(&self) -> Option<(usize, usize)> {
+        let track = self.now_playing.as_ref()?;
+        let Ok(lyrics) = self.lyrics_cache.get(&track.id)? else {
+            return None;
+        };
+        if !lyrics.synced || lyrics.lines.is_empty() {
+            return None;
+        }
+        let pos_ms = self.position.as_millis() as u64 + 250;
+        let idx = lyrics
+            .lines
+            .iter()
+            .rposition(|l| l.time_ms.is_some_and(|t| t <= pos_ms))?;
+        Some((idx, lyrics.lines.len()))
+    }
+
+    fn sync_lyrics_scroll(&mut self) -> Task<Message> {
+        if self.page != Page::UpNext || self.up_next_tab != UpNextTab::Lyrics {
+            return Task::none();
+        }
+        let Some((idx, total)) = self.current_lyric_index() else {
+            return Task::none();
+        };
+        if self.last_active_lyric == Some(idx) {
+            return Task::none();
+        }
+        self.last_active_lyric = Some(idx);
+        let ratio = if total > 1 {
+            (idx as f32 / (total - 1) as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        operation::snap_to(
+            self.lyrics_scroll_id.clone(),
+            scrollable::RelativeOffset { x: 0.0, y: ratio },
         )
     }
 
@@ -2149,37 +2283,168 @@ impl Hum {
             .into()
         };
 
-        let mut queue_rows = column![
-            row![
-                text(format!("Up next ({})", self.queue.len()))
-                    .size(16)
-                    .color(style::TEXT_PRIMARY),
-                space::horizontal().width(Length::Fill),
-                button(text("Clear").size(12))
-                    .on_press(Message::ClearQueue)
-                    .padding([5, 12])
-                    .style(style::pill_button(false)),
-            ]
-            .align_y(Alignment::Center)
+        let mut tabs_row = row![
+            button(text(format!("Up next ({})", self.queue.len())).size(13))
+                .on_press(Message::SetUpNextTab(UpNextTab::Queue))
+                .padding([6, 14])
+                .style(style::pill_button(self.up_next_tab == UpNextTab::Queue)),
+            button(text("Lyrics").size(13))
+                .on_press(Message::SetUpNextTab(UpNextTab::Lyrics))
+                .padding([6, 14])
+                .style(style::pill_button(self.up_next_tab == UpNextTab::Lyrics)),
+            space::horizontal().width(Length::Fill),
         ]
-        .spacing(8);
+        .spacing(8)
+        .align_y(Alignment::Center);
 
-        for (i, track) in self.queue.iter().enumerate() {
-            let is_active = self.current_index == Some(i);
-            queue_rows = queue_rows.push(self.view_track_row(
-                track,
-                is_active,
-                Message::PlayTrackList {
-                    tracks: self.queue.clone(),
-                    index: i,
-                },
-                Some(Message::RemoveFromQueue(i)),
-            ));
-        }
+        let right_panel: Element<'_, Message> = match self.up_next_tab {
+            UpNextTab::Queue => {
+                tabs_row = tabs_row.push(
+                    button(text("Clear").size(12))
+                        .on_press(Message::ClearQueue)
+                        .padding([5, 12])
+                        .style(style::pill_button(false)),
+                );
 
-        let right_panel = scrollable(queue_rows.padding([20, 20]))
-            .width(Length::FillPortion(5))
-            .height(Length::Fill);
+                let mut queue_rows = column![tabs_row].spacing(10);
+                for (i, track) in self.queue.iter().enumerate() {
+                    let is_active = self.current_index == Some(i);
+                    queue_rows = queue_rows.push(self.view_track_row(
+                        track,
+                        is_active,
+                        Message::PlayTrackList {
+                            tracks: self.queue.clone(),
+                            index: i,
+                        },
+                        Some(Message::RemoveFromQueue(i)),
+                    ));
+                }
+
+                scrollable(queue_rows.padding([20, 20]))
+                    .width(Length::FillPortion(5))
+                    .height(Length::Fill)
+                    .into()
+            }
+            UpNextTab::Lyrics => {
+                if let Some(track) = &self.now_playing
+                    && let Some(Ok(lyrics)) = self.lyrics_cache.get(&track.id)
+                {
+                    let badge = if lyrics.synced {
+                        format!("{} • Live", lyrics.source)
+                    } else {
+                        lyrics.source.clone()
+                    };
+                    tabs_row = tabs_row.push(text(badge).size(11).color(style::TEXT_MUTED));
+                }
+
+                let lyrics_body: Element<'_, Message> = if let Some(track) = &self.now_playing {
+                    if self.lyrics_loading {
+                        container(
+                            text("Loading lyrics...")
+                                .size(14)
+                                .color(style::TEXT_MUTED),
+                        )
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
+                        .into()
+                    } else {
+                        match self.lyrics_cache.get(&track.id) {
+                            Some(Ok(lyrics)) => {
+                                let active_idx = self.current_lyric_index().map(|(i, _)| i);
+                                let mut lines_col = column![space::vertical().height(90)].spacing(6);
+
+                                for (i, line) in lyrics.lines.iter().enumerate() {
+                                    let is_active = active_idx == Some(i);
+                                    let is_past = active_idx.is_some_and(|cur| i < cur);
+
+                                    let color = if is_active || !lyrics.synced {
+                                        style::TEXT_PRIMARY
+                                    } else if is_past {
+                                        style::TEXT_SECONDARY
+                                    } else {
+                                        style::TEXT_MUTED
+                                    };
+                                    let font_size = if is_active { 19 } else { 15 };
+
+                                    let bar = container(space::horizontal().width(3).height(20))
+                                        .style(move |_: &Theme| container::Style {
+                                            background: Some(Background::Color(if is_active {
+                                                style::YT_RED
+                                            } else {
+                                                Color::TRANSPARENT
+                                            })),
+                                            border: iced::Border {
+                                                radius: 2.0.into(),
+                                                ..Default::default()
+                                            },
+                                            ..Default::default()
+                                        });
+
+                                    let mut btn = button(
+                                        row![bar, text(&line.text).size(font_size).color(color)]
+                                            .spacing(10)
+                                            .align_y(Alignment::Center),
+                                    )
+                                    .padding([6, 8])
+                                    .width(Length::Fill)
+                                    .style(style::track_row(false));
+
+                                    if let Some(ms) = line.time_ms {
+                                        btn = btn.on_press(Message::SeekToMs(ms));
+                                    }
+                                    lines_col = lines_col.push(btn);
+                                }
+
+                                lines_col = lines_col.push(space::vertical().height(120));
+
+                                scrollable(lines_col.padding([0, 12]))
+                                    .id(self.lyrics_scroll_id.clone())
+                                    .width(Length::Fill)
+                                    .height(Length::Fill)
+                                    .into()
+                            }
+                            Some(Err(err)) => container(
+                                text(err).size(14).color(style::TEXT_MUTED),
+                            )
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .center_x(Length::Fill)
+                            .center_y(Length::Fill)
+                            .into(),
+                            None => container(
+                                text("Loading lyrics...")
+                                    .size(14)
+                                    .color(style::TEXT_MUTED),
+                            )
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .center_x(Length::Fill)
+                            .center_y(Length::Fill)
+                            .into(),
+                        }
+                    }
+                } else {
+                    container(
+                        text("Pick a song to see live lyrics")
+                            .size(14)
+                            .color(style::TEXT_MUTED),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
+                };
+
+                container(column![tabs_row, lyrics_body].spacing(12))
+                    .padding([20, 20])
+                    .width(Length::FillPortion(5))
+                    .height(Length::Fill)
+                    .into()
+            }
+        };
 
         row![left_panel, right_panel]
             .spacing(16)
@@ -2660,9 +2925,20 @@ impl Hum {
             .step(0.02_f32)
             .style(style::volume_slider)
             .width(86),
+            button(icons::lyrics(
+                17.0,
+                if self.page == Page::UpNext && self.up_next_tab == UpNextTab::Lyrics {
+                    style::TEXT_PRIMARY
+                } else {
+                    style::TEXT_SECONDARY
+                }
+            ))
+            .on_press(Message::OpenLyricsPage)
+            .padding(8)
+            .style(style::icon_button),
             button(icons::queue(
                 18.0,
-                if self.page == Page::UpNext {
+                if self.page == Page::UpNext && self.up_next_tab == UpNextTab::Queue {
                     style::TEXT_PRIMARY
                 } else {
                     style::TEXT_SECONDARY

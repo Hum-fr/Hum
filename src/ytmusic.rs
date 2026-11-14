@@ -9,14 +9,15 @@ use tokio::sync::{RwLock, Semaphore};
 
 use crate::auth::{app_data_dir, sapisid_auth_header};
 use crate::types::{
-    CollectionCard, MoodPill, PlaylistPage, SearchSuggestion, Shelf, ShelfItem, Track,
-    parse_duration_secs,
+    CollectionCard, LyricLine, MoodPill, PlaylistPage, SearchSuggestion, Shelf, ShelfItem, Track,
+    TrackLyrics, parse_duration_secs,
 };
 
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const SUGGESTIONS_URL: &str =
     "https://music.youtube.com/youtubei/v1/music/get_search_suggestions?prettyPrint=false";
 const BROWSE_URL: &str = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false";
+const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
 const ACCOUNT_MENU_URL: &str =
     "https://music.youtube.com/youtubei/v1/account/account_menu?prettyPrint=false";
 const PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
@@ -1296,6 +1297,366 @@ pub async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u
         .map_err(|e| format!("Failed reading bytes: {e}"))
 }
 
+const LRCLIB_GET_URL: &str = "https://lrclib.net/api/get";
+const LRCLIB_SEARCH_URL: &str = "https://lrclib.net/api/search";
+
+pub async fn fetch_track_lyrics(
+    client: &reqwest::Client,
+    track: &Track,
+    auth: Option<&YtmAuth>,
+) -> Result<TrackLyrics, String> {
+    let (clean_title, clean_artist) = clean_track_meta(&track.title, &track.artist);
+
+    if let Ok(lyrics) = fetch_lrclib_lyrics(client, &clean_title, &clean_artist, track.duration_secs).await {
+        return Ok(lyrics);
+    }
+
+    if let Ok(lyrics) = fetch_ytm_lyrics(client, &track.id, auth).await {
+        return Ok(lyrics);
+    }
+
+    Err(String::from("No lyrics found for this track."))
+}
+
+fn clean_track_meta(title: &str, artist: &str) -> (String, String) {
+    let strip_brackets = |input: &str| -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut depth_paren = 0usize;
+        let mut depth_bracket = 0usize;
+        for ch in input.chars() {
+            match ch {
+                '(' => depth_paren += 1,
+                ')' if depth_paren > 0 => depth_paren -= 1,
+                '[' => depth_bracket += 1,
+                ']' if depth_bracket > 0 => depth_bracket -= 1,
+                _ if depth_paren == 0 && depth_bracket == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+
+    let mut clean_title = strip_brackets(title);
+    for marker in [" feat.", " ft.", " featuring "] {
+        if let Some(pos) = clean_title.to_ascii_lowercase().find(marker) {
+            clean_title.truncate(pos);
+        }
+    }
+    let clean_title = clean_title.trim().to_string();
+    let final_title = if clean_title.is_empty() {
+        title.trim().to_string()
+    } else {
+        clean_title
+    };
+
+    let clean_artist = artist
+        .split(" • ")
+        .next()
+        .unwrap_or(artist)
+        .trim()
+        .strip_suffix(" - Topic")
+        .unwrap_or_else(|| artist.split(" • ").next().unwrap_or(artist).trim())
+        .trim()
+        .to_string();
+
+    (final_title, clean_artist)
+}
+
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+async fn fetch_lrclib_lyrics(
+    client: &reqwest::Client,
+    title: &str,
+    artist: &str,
+    duration_secs: Option<u64>,
+) -> Result<TrackLyrics, String> {
+    let mut get_url = format!(
+        "{LRCLIB_GET_URL}?track_name={}&artist_name={}",
+        encode_uri_component(title),
+        encode_uri_component(artist)
+    );
+    if let Some(dur) = duration_secs {
+        get_url.push_str(&format!("&duration={dur}"));
+    }
+
+    if let Ok(res) = client.get(&get_url).send().await
+        && res.status().is_success()
+        && let Ok(val) = res.json::<Value>().await
+        && let Some(lyrics) = extract_lrclib_entry(&val)
+    {
+        return Ok(lyrics);
+    }
+
+    let search_q = format!("{artist} {title}");
+    let search_url = format!(
+        "{LRCLIB_SEARCH_URL}?q={}",
+        encode_uri_component(search_q.trim())
+    );
+    let res = client
+        .get(&search_url)
+        .send()
+        .await
+        .map_err(|e| format!("LRCLIB search failed: {e}"))?;
+
+    if !res.status().is_success() {
+        return Err(format!("LRCLIB returned HTTP {}", res.status()));
+    }
+
+    let list: Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Invalid LRCLIB JSON: {e}"))?;
+    let items = list
+        .as_array()
+        .ok_or_else(|| String::from("Unexpected LRCLIB response"))?;
+
+    // Prefer a synced entry close in duration, then any synced entry, then plain text.
+    let mut best_synced: Option<(u64, TrackLyrics)> = None;
+    let mut best_plain: Option<TrackLyrics> = None;
+
+    for item in items {
+        let Some(parsed) = extract_lrclib_entry(item) else {
+            continue;
+        };
+        if parsed.synced {
+            let item_dur = item.get("duration").and_then(|v| v.as_f64()).map(|d| d.round() as u64);
+            let diff = match (duration_secs, item_dur) {
+                (Some(a), Some(b)) => a.abs_diff(b),
+                _ => 999,
+            };
+            if best_synced.as_ref().is_none_or(|(d, _)| diff < *d) {
+                best_synced = Some((diff, parsed));
+            }
+        } else if best_plain.is_none() {
+            best_plain = Some(parsed);
+        }
+    }
+
+    best_synced
+        .map(|(_, l)| l)
+        .or(best_plain)
+        .ok_or_else(|| String::from("No lyrics on LRCLIB"))
+}
+
+fn extract_lrclib_entry(val: &Value) -> Option<TrackLyrics> {
+    if let Some(synced_raw) = val
+        .get("syncedLyrics")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        let lines = parse_lrc(synced_raw);
+        if !lines.is_empty() {
+            return Some(TrackLyrics {
+                lines,
+                synced: true,
+                source: String::from("LRCLIB (synced)"),
+            });
+        }
+    }
+
+    let plain_raw = val
+        .get("plainLyrics")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())?;
+    let lines: Vec<LyricLine> = plain_raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| LyricLine {
+            time_ms: None,
+            text: l.to_string(),
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(TrackLyrics {
+        lines,
+        synced: false,
+        source: String::from("LRCLIB"),
+    })
+}
+
+pub fn parse_lrc(raw: &str) -> Vec<LyricLine> {
+    let mut parsed: Vec<(u64, String)> = Vec::new();
+
+    for line in raw.lines() {
+        let mut rest = line.trim();
+        let mut timestamps = Vec::new();
+
+        while let Some(after_open) = rest.strip_prefix('[') {
+            let Some(close_idx) = after_open.find(']') else {
+                break;
+            };
+            let tag = &after_open[..close_idx];
+            if let Some(ms) = parse_lrc_timestamp(tag) {
+                timestamps.push(ms);
+            }
+            rest = after_open[close_idx + 1..].trim_start();
+        }
+
+        let text = rest.trim();
+        if text.is_empty() || timestamps.is_empty() {
+            continue;
+        }
+        for ms in timestamps {
+            parsed.push((ms, text.to_string()));
+        }
+    }
+
+    parsed.sort_by_key(|(ms, _)| *ms);
+    parsed
+        .into_iter()
+        .map(|(ms, text)| LyricLine {
+            time_ms: Some(ms),
+            text,
+        })
+        .collect()
+}
+
+fn parse_lrc_timestamp(tag: &str) -> Option<u64> {
+    let (min_str, sec_part) = tag.trim().split_once(':')?;
+    let mins: u64 = min_str.parse().ok()?;
+    let (sec_str, frac_ms) = match sec_part.split_once('.') {
+        Some((s, frac)) => {
+            let digits: String = frac.chars().take(3).collect();
+            let val: u64 = digits.parse().ok()?;
+            let scaled = match digits.len() {
+                1 => val * 100,
+                2 => val * 10,
+                3 => val,
+                _ => 0,
+            };
+            (s, scaled)
+        }
+        None => (sec_part, 0),
+    };
+    let secs: u64 = sec_str.parse().ok()?;
+    Some((mins * 60 + secs) * 1000 + frac_ms)
+}
+
+async fn fetch_ytm_lyrics(
+    client: &reqwest::Client,
+    video_id: &str,
+    auth: Option<&YtmAuth>,
+) -> Result<TrackLyrics, String> {
+    let next_val = post_innertube(
+        client,
+        NEXT_URL,
+        json!({
+            "context": client_context(),
+            "videoId": video_id,
+        }),
+        auth,
+    )
+    .await?;
+
+    let tabs = next_val
+        .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| String::from("No watch tabs"))?;
+
+    let browse_id = tabs
+        .iter()
+        .find_map(|t| {
+            let tr = t.get("tabRenderer")?;
+            let title = tr.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            if !title.eq_ignore_ascii_case("Lyrics") {
+                return None;
+            }
+            tr.pointer("/endpoint/browseEndpoint/browseId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| String::from("Lyrics tab unavailable"))?;
+
+    let browse_val = post_innertube(
+        client,
+        BROWSE_URL,
+        json!({
+            "context": client_context(),
+            "browseId": browse_id,
+        }),
+        auth,
+    )
+    .await?;
+
+    let sections = browse_val
+        .pointer("/contents/sectionListRenderer/contents")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| String::from("Empty lyrics browse response"))?;
+
+    for section in sections {
+        if let Some(timed) = section
+            .pointer("/musicTimedLyricsRenderer/timedLyricsData")
+            .and_then(|v| v.as_array())
+        {
+            let lines: Vec<LyricLine> = timed
+                .iter()
+                .filter_map(|item| {
+                    let text = item.get("lyricLine")?.as_str()?.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let ms = item
+                        .pointer("/cueRange/startTimeMilliseconds")
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                        });
+                    Some(LyricLine {
+                        time_ms: ms,
+                        text: text.to_string(),
+                    })
+                })
+                .collect();
+            if !lines.is_empty() {
+                return Ok(TrackLyrics {
+                    synced: lines.iter().any(|l| l.time_ms.is_some()),
+                    lines,
+                    source: String::from("YouTube Music"),
+                });
+            }
+        }
+
+        if let Some(runs_val) =
+            runs_text(section.pointer("/musicDescriptionShelfRenderer/description/runs"))
+        {
+            let lines: Vec<LyricLine> = runs_val
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| LyricLine {
+                    time_ms: None,
+                    text: l.to_string(),
+                })
+                .collect();
+            if !lines.is_empty() {
+                return Ok(TrackLyrics {
+                    lines,
+                    synced: false,
+                    source: String::from("YouTube Music"),
+                });
+            }
+        }
+    }
+
+    Err(String::from("No lyrics in YouTube Music response"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1401,6 +1762,24 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(matches!(&parsed[0], SearchSuggestion::Query(q) if q == "juice wrld"));
         assert!(matches!(&parsed[1], SearchSuggestion::Browse(c) if c.title == "Juice WRLD"));
+    }
+
+    #[test]
+    fn parses_lrc_timestamps_and_cleans_metadata() {
+        let lrc = "[ar:Juice WRLD]\n[00:00.22] Enviyon on the mix\n[00:07.13][01:12.50] No, no, no, no\n[00:12.00]   \n";
+        let lines = parse_lrc(lrc);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].time_ms, Some(220));
+        assert_eq!(lines[0].text, "Enviyon on the mix");
+        assert_eq!(lines[1].time_ms, Some(7130));
+        assert_eq!(lines[2].time_ms, Some(72500));
+
+        let (title, artist) = clean_track_meta(
+            "Lucid Dreams (Official Music Video) feat. Sting [Explicit]",
+            "Juice WRLD - Topic • 1.2B views",
+        );
+        assert_eq!(title, "Lucid Dreams");
+        assert_eq!(artist, "Juice WRLD");
     }
 
     #[tokio::test]
