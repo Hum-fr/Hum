@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy — hum</title>
+  <style>
+    :root {
+      --bg: #0b0b0d;
+      --surface: #151519;
+      --border: #26262e;
+      --text: #f3f3f6;
+      --muted: #b0b0bc;
+      --accent: #ff2e55;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+    }
+    .wrap {
+      max-width: 780px;
+      margin: 0 auto;
+      padding: 48px 20px 64px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+    }
+    .brand {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .brand span { color: var(--accent); }
+    nav a {
+      color: var(--muted);
+      text-decoration: none;
+      margin-left: 18px;
+      font-size: 0.95rem;
+    }
+    nav a:hover { color: var(--text); }
+    h1 {
+      font-size: 2rem;
+      margin: 0 0 8px;
+      letter-spacing: -0.02em;
+    }
+    .updated {
+      color: var(--muted);
+      font-size: 0.92rem;
+      margin: 0 0 28px;
+    }
+    h2 {
+      font-size: 1.2rem;
+      margin: 30px 0 10px;
+    }
+    p, li {
+      color: var(--muted);
+      font-size: 0.97rem;
+    }
+    ul {
+      padding-left: 20px;
+    }
+    li { margin-bottom: 8px; }
+    code {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 5px;
+      font-size: 0.88em;
+      color: var(--text);
+    }
+    a { color: #ff6b86; }
+    .box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin: 20px 0;
+    }
+    footer {
+      margin-top: 48px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" href="./">hum<span>.</span></a>
+      <nav>
+        <a href="./">Home</a>
+        <a href="https://github.com/Hum-fr/Hum">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <h1>Privacy Policy for hum</h1>
+      <p class="updated">Effective date: November 14, 2026</p>
+
+      <div class="box">
+        <strong>Summary:</strong> <strong>hum</strong> is a local desktop application with no developer-operated servers. Any Google account data you authorize is fetched directly by your device from Google APIs, used only inside the app to show your profile and YouTube library, and stored solely on your own computer.
+      </div>
+
+      <h2>1. Application Overview</h2>
+      <p>
+        <strong>hum</strong> is an open-source desktop client for YouTube Music (<a href="https://github.com/Hum-fr/Hum">github.com/Hum-fr/Hum</a>). This Privacy Policy explains what data <strong>hum</strong> accesses when you choose to sign in with Google, how that data is used and stored, and how you can remove it.
+      </p>
+
+      <h2>2. Information We Access</h2>
+      <p>
+        You can browse and play public music in <strong>hum</strong> without signing in. If you choose to click <strong>Authorize with Google</strong>, <strong>hum</strong> uses Google OAuth 2.0 (PKCE with a temporary local callback on <code>127.0.0.1</code>) to request the following read-only permissions (scopes):
+      </p>
+      <ul>
+        <li>
+          <code>openid</code>, <code>profile</code>, and <code>email</code>: Grants access to your basic Google profile information (your display name and email address) from Google's UserInfo endpoint.
+        </li>
+        <li>
+          <code>https://www.googleapis.com/auth/youtube.readonly</code>: Grants read-only access to your YouTube account's playlists, playlist items, and liked videos via the YouTube Data API v3. <strong>hum</strong> never requests write access and cannot modify, upload, or delete anything on your YouTube or Google account.
+        </li>
+      </ul>
+
+      <h2>3. How We Use Your Data</h2>
+      <p>Data retrieved from Google APIs is used strictly to provide core app functionality on your device:</p>
+      <ul>
+        <li>Displaying your signed-in name and email address inside the <strong>hum</strong> account section.</li>
+        <li>Loading your YouTube playlists and liked songs so you can browse and play them in <strong>hum</strong>.</li>
+        <li>Refreshing your OAuth access token locally so you do not have to re-authenticate every launch.</li>
+      </ul>
+
+      <h2>4. Data Storage and Security</h2>
+      <ul>
+        <li><strong>Local-only storage:</strong> <strong>hum</strong> has no backend server, database, or cloud storage operated by the developer. Your Google OAuth tokens (<code>access_token</code>, optional <code>refresh_token</code>, expiration time) and your display name/email are saved locally on your computer at <code>%LOCALAPPDATA%\hum\google_auth.json</code> (Windows) or <code>~/.local/share/hum/google_auth.json</code> (macOS/Linux).</li>
+        <li><strong>Local library &amp; cache:</strong> Custom local playlists, locally liked tracks, listening history, and optional helper binaries (such as <code>yt-dlp</code>) are stored only in your local app data folder.</li>
+        <li><strong>Transport security:</strong> All communication with Google OAuth and YouTube APIs happens directly between your computer and Google over HTTPS.</li>
+      </ul>
+
+      <h2>5. Data Sharing, Disclosure, and Tracking</h2>
+      <ul>
+        <li>We do <strong>not</strong> sell, rent, trade, or transfer your Google user data or personal information to any third party.</li>
+        <li>We do <strong>not</strong> send your Google user data to any developer server.</li>
+        <li><strong>hum</strong> contains no third-party advertising SDKs, analytics trackers, or telemetry.</li>
+        <li>We do not use Google user data to train machine learning or AI models.</li>
+      </ul>
+
+      <h2>6. Google API Services User Data Policy (Limited Use)</h2>
+      <p>
+        <strong>hum</strong>'s use and transfer to any other app of information received from Google APIs adheres to the
+        <a href="https://developers.google.com/terms/api-data-policy">Google API Services User Data Policy</a>,
+        including the Limited Use requirements.
+      </p>
+
+      <h2>7. Data Retention and Deletion</h2>
+      <p>
+        Your Google session data remains stored locally on your device only until you remove it:
+      </p>
+      <ul>
+        <li><strong>Sign out in the app:</strong> Signing out inside <strong>hum</strong> immediately deletes the local <code>google_auth.json</code> file.</li>
+        <li><strong>Manual removal:</strong> You can delete the local app data directory (<code>%LOCALAPPDATA%\hum\</code> on Windows or <code>~/.local/share/hum/</code> on macOS/Linux) at any time.</li>
+        <li><strong>Revoke Google access:</strong> You can revoke <strong>hum</strong>'s OAuth access at any time in your Google Account settings at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</li>
+      </ul>
+
+      <h2>8. Changes to This Policy</h2>
+      <p>
+        If <strong>hum</strong>'s data practices change, this Privacy Policy will be updated at this URL with a revised effective date.
+      </p>
+
+      <h2>9. Contact</h2>
+      <p>
+        If you have questions about this Privacy Policy or how <strong>hum</strong> handles data, please open an issue on the project repository at
+        <a href="https://github.com/Hum-fr/Hum/issues">github.com/Hum-fr/Hum/issues</a>.
+      </p>
+    </main>
+
+    <footer>
+      <span>hum &mdash; <a href="./">Back to Home</a></span>
+    </footer>
+  </div>
+</body>
+</html>
