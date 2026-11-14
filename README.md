@@ -6,13 +6,11 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 
 ---
 
-## What's New in v0.1.1
+## What's New in v0.1.2
 
-- **Faster Audio Startup & Decoding** — Direct stream URL extraction paired with native HTTP/2 Rust downloads, magic-byte container sniffing (`m4a`/`mp3`/`ogg`/`flac`/`wav`) to skip redundant probes, configurable multi-track queue prefetching, and a local disk audio cache for instant replays.
-- **Embedded `yt-dlp`** — GitHub Release builds now bundle `yt-dlp.exe` directly inside `hum.exe` (extracted automatically on first run to `%LOCALAPPDATA%\hum\`). No extra files or manual setup needed.
-- **Google Profile Pictures** — Displays your circular Google account avatar in the top header, account modal, and Settings page.
-- **Settings Page** — Dedicated **Settings** view in the sidebar for Account management, Audio engine status & one-click `yt-dlp` updates, Disk audio cache toggles & cleanup, Queue prefetch depth (`Off` / `1` / `2` tracks), persistent Volume, Listening history cleanup, and Keyboard shortcuts.
-- **Zero-Config Google Sign-In** — Built-in WebView2 **"Sign in to YouTube Music"** popup syncs your personalized Home feed, YouTube Music playlists, and liked songs with no Google Cloud setup required.
+- **Sub-Second Native Song Loading** — Extracts direct audio streams in pure Rust via InnerTube (pre-warming `visitorData` at startup) and fetches 1 MiB byte-range HTTP/2 chunks to avoid single-GET throttling, eliminating `yt-dlp` startup delays on normal tracks (`yt-dlp` remains as an automatic fallback).
+- **Live Search Preview Dropdown** — Debounced autocomplete below the search bar showing suggested search queries, artists/albums, and playable tracks with cover art while you type.
+- **Update Popup & 1-Click Updater** — Checks GitHub Releases automatically on launch (or from **Settings → About**), displays release notes in-app, and updates & restarts `hum.exe` in one click.
 
 ---
 
@@ -21,6 +19,7 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 - **YouTube Music Browse & Search**
   - **Home** feed with *Listen again* history, Quick Picks, and curated mixes/albums (personalized when signed in)
   - **Explore** page with Moods & Genres pills, New Releases, and trending shelves
+  - **Live Search Preview** — Debounced autocomplete dropdown as you type, showing suggested queries, artists/albums, and directly playable tracks
   - **Search** across both individual **Songs** and **Playlists & Mixes**
 - **Fast Native Audio Playback**
   - Direct stream extraction + native Rust HTTP/2 download with `yt-dlp` fallback
@@ -36,8 +35,9 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
   - Syncs your Google avatar, account name/email, personalized Home feed, YouTube Music playlists, and Liked Music
 - **Settings**
   - Toggle disk audio cache, inspect cached size & clear cache, configure prefetch depth, update `yt-dlp`, clear listening history, and view saved data paths
-- **Single-File Portable Releases**
+- **Single-File Portable Releases & Auto-Updater**
   - Official releases embed `yt-dlp.exe` right inside `hum.exe`
+  - Checks GitHub Releases on startup (or manually in **Settings → About**), shows an update popup with release notes, and performs 1-click in-place `hum.exe` updates & restart
 
 ---
 
@@ -106,7 +106,8 @@ src/
 ├── audio.rs         # Dedicated rodio playback thread with fast container hinting
 ├── auth.rs          # WebView2 YouTube Music session, library sync & local JSON storage
 ├── webview_login.rs # Embedded WebView2 "Sign in to YouTube Music" popup window
-├── ytmusic.rs       # InnerTube browse/search, direct stream downloader & disk cache
+├── ytmusic.rs       # InnerTube browse/search, live suggestions, stream downloader & disk cache
+├── updater.rs       # GitHub Releases update checker & 1-click Windows self-updater
 ├── icons.rs         # Inline SVG vector icons
 ├── style.rs         # YouTube Music dark theme & widget styling
 └── types.rs         # Domain types, settings & formatting helpers

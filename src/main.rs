@@ -6,6 +6,7 @@ mod auth;
 mod icons;
 mod style;
 mod types;
+mod updater;
 mod webview_login;
 mod ytmusic;
 
@@ -17,6 +18,8 @@ fn main() -> iced::Result {
     if let Some(out_path) = webview_login::signin_arg() {
         std::process::exit(webview_login::run_signin_window(&out_path));
     }
+
+    updater::cleanup_old_exe();
 
     iced::application(Hum::boot, Hum::update, Hum::view)
         .title(Hum::title)

@@ -38,6 +38,13 @@ pub enum ShelfItem {
 }
 
 #[derive(Debug, Clone)]
+pub enum SearchSuggestion {
+    Query(String),
+    Track(Track),
+    Browse(CollectionCard),
+}
+
+#[derive(Debug, Clone)]
 pub struct Shelf {
     pub title: String,
     pub items: Vec<ShelfItem>,

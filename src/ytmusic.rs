@@ -5,17 +5,24 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::auth::{app_data_dir, sapisid_auth_header};
 use crate::types::{
-    CollectionCard, MoodPill, PlaylistPage, Shelf, ShelfItem, Track, parse_duration_secs,
+    CollectionCard, MoodPill, PlaylistPage, SearchSuggestion, Shelf, ShelfItem, Track,
+    parse_duration_secs,
 };
 
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
+const SUGGESTIONS_URL: &str =
+    "https://music.youtube.com/youtubei/v1/music/get_search_suggestions?prettyPrint=false";
 const BROWSE_URL: &str = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false";
 const ACCOUNT_MENU_URL: &str =
     "https://music.youtube.com/youtubei/v1/account/account_menu?prettyPrint=false";
+const PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+const VISITOR_URL: &str = "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false";
+const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+const STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
 const SONGS_PARAM: &str = "EgWKAQIIAWoMEAMQBBAJEAoQBRAR";
 const PLAYLISTS_PARAM: &str = "EgWKAQIoAWoMEAMQBBAJEAoQBRAR";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -27,6 +34,7 @@ pub struct YtmAuth {
 }
 
 static THUMB_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(6));
+static VISITOR_DATA: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -197,6 +205,90 @@ pub async fn fetch_playlist(
 
     let body = post_innertube(client, BROWSE_URL, payload, auth).await?;
     Ok(parse_playlist_page(&body))
+}
+
+pub async fn fetch_search_suggestions(
+    client: &reqwest::Client,
+    input: &str,
+    auth: Option<&YtmAuth>,
+) -> Result<Vec<SearchSuggestion>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let payload = json!({
+        "context": client_context(),
+        "input": trimmed,
+    });
+    let body = post_innertube(client, SUGGESTIONS_URL, payload, auth).await?;
+    Ok(parse_search_suggestions(&body))
+}
+
+pub fn parse_search_suggestions(root: &Value) -> Vec<SearchSuggestion> {
+    let mut out = Vec::new();
+    let Some(sections) = root.get("contents").and_then(|v| v.as_array()) else {
+        return out;
+    };
+
+    for section in sections {
+        let Some(items) = section
+            .pointer("/searchSuggestionsSectionRenderer/contents")
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+
+        for item in items {
+            if out.len() >= 8 {
+                return out;
+            }
+            if let Some(sug) = item.get("searchSuggestionRenderer") {
+                if let Some(q) = runs_text(sug.pointer("/suggestion/runs")).or_else(|| {
+                    sug.pointer("/navigationEndpoint/searchEndpoint/query")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                }) {
+                    out.push(SearchSuggestion::Query(q));
+                }
+            } else if let Some(track) = parse_song_item(item) {
+                out.push(SearchSuggestion::Track(track));
+            } else if let Some(renderer) = item.get("musicResponsiveListItemRenderer")
+                && let Some(browse_id) = renderer
+                    .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                    .and_then(|v| v.as_str())
+                && let Some(title) = runs_text(
+                    renderer
+                        .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs"),
+                )
+            {
+                let params = renderer
+                    .pointer("/navigationEndpoint/browseEndpoint/params")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let subtitle = runs_text(
+                    renderer
+                        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs"),
+                )
+                .unwrap_or_default();
+                let thumb_url = pick_thumbnail(
+                    renderer
+                        .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+                        .and_then(|v| v.as_array()),
+                    120,
+                );
+                out.push(SearchSuggestion::Browse(CollectionCard {
+                    browse_id: browse_id.to_string(),
+                    params,
+                    title,
+                    subtitle,
+                    thumb_url,
+                }));
+            }
+        }
+    }
+
+    out
 }
 
 pub fn parse_browse_shelves(root: &Value) -> Vec<Shelf> {
@@ -814,6 +906,49 @@ pub async fn install_yt_dlp(client: &reqwest::Client) -> Result<PathBuf, String>
     Ok(dest)
 }
 
+pub async fn warm_visitor_data(client: &reqwest::Client) {
+    let _ = get_visitor_data(client, false).await;
+}
+
+async fn get_visitor_data(client: &reqwest::Client, force_refresh: bool) -> Result<String, String> {
+    if !force_refresh
+        && let Some(cached) = VISITOR_DATA.read().await.clone()
+    {
+        return Ok(cached);
+    }
+
+    let payload = json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20261101.00.00"
+            }
+        }
+    });
+
+    let res = client
+        .post(VISITOR_URL)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Visitor ID request failed: {e}"))?;
+
+    let val: Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Invalid visitor ID JSON: {e}"))?;
+
+    let visitor_data = val
+        .pointer("/responseContext/visitorData")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| String::from("Missing visitorData in response"))?
+        .to_string();
+
+    *VISITOR_DATA.write().await = Some(visitor_data.clone());
+    Ok(visitor_data)
+}
+
 pub async fn fetch_track_audio(
     client: &reqwest::Client,
     video_id: &str,
@@ -827,19 +962,16 @@ pub async fn fetch_track_audio(
         return Ok(bytes);
     }
 
-    let yt_dlp = find_yt_dlp().ok_or_else(|| {
-        String::from("yt-dlp not found. Click Setup audio in the top bar.")
-    })?;
-
-    // Fast path: ask yt-dlp for the direct stream URL and download in native Rust over HTTP/2.
-    let bytes = match fetch_direct_via_yt_dlp(client, &yt_dlp, video_id).await {
+    // Primary ultra-fast path: native Rust InnerTube player + ranged HTTP/2 chunks (no subprocess).
+    let bytes = match fetch_direct_via_innertube(client, video_id).await {
         Ok(b) => b,
-        Err(_) => match run_yt_dlp_audio(&yt_dlp, video_id, Some("youtube:player_client=android_vr,ios,web")).await {
-            Ok(b) => b,
-            Err(first_err) => run_yt_dlp_audio(&yt_dlp, video_id, None)
-                .await
-                .map_err(|_| first_err)?,
-        },
+        Err(native_err) => {
+            let yt_dlp = find_yt_dlp().ok_or(native_err)?;
+            match fetch_direct_via_yt_dlp(client, &yt_dlp, video_id).await {
+                Ok(b) => b,
+                Err(_) => run_yt_dlp_audio(&yt_dlp, video_id, None).await?,
+            }
+        }
     };
 
     if use_cache && let Some(path) = cache_file_path(video_id) {
@@ -860,6 +992,186 @@ pub async fn fetch_track_audio(
     Ok(bytes)
 }
 
+async fn fetch_direct_via_innertube(
+    client: &reqwest::Client,
+    video_id: &str,
+) -> Result<Vec<u8>, String> {
+    let mut visitor_data = get_visitor_data(client, false).await?;
+    let mut meta = query_visionos_player(client, video_id, &visitor_data).await?;
+
+    if extract_best_audio_stream(&meta).is_none() {
+        visitor_data = get_visitor_data(client, true).await?;
+        meta = query_visionos_player(client, video_id, &visitor_data).await?;
+    }
+
+    let (stream_url, content_length) = extract_best_audio_stream(&meta).ok_or_else(|| {
+        let reason = meta
+            .pointer("/playabilityStatus/reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("No direct audio stream returned");
+        reason.to_string()
+    })?;
+
+    let headers = vec![(String::from("User-Agent"), String::from(VISIONOS_UA))];
+    download_ranged_stream(client, &stream_url, content_length, &headers).await
+}
+
+async fn query_visionos_player(
+    client: &reqwest::Client,
+    video_id: &str,
+    visitor_data: &str,
+) -> Result<Value, String> {
+    let payload = json!({
+        "context": {
+            "client": {
+                "clientName": "VISIONOS",
+                "clientVersion": "0.1",
+                "hl": "en",
+                "gl": "US",
+                "osName": "visionOS",
+                "osVersion": "1.0",
+                "deviceMake": "Apple",
+                "deviceModel": "RealityDevice14,1",
+                "visitorData": visitor_data
+            }
+        },
+        "videoId": video_id,
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "signatureTimestamp": 20073
+            }
+        },
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    });
+
+    let res = client
+        .post(PLAYER_URL)
+        .header("User-Agent", VISIONOS_UA)
+        .header("X-Goog-Visitor-Id", visitor_data)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Player request failed: {e}"))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Player API returned HTTP {}", res.status()));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| format!("Invalid player JSON: {e}"))
+}
+
+fn extract_best_audio_stream(meta: &Value) -> Option<(String, Option<u64>)> {
+    let status = meta
+        .pointer("/playabilityStatus/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if status != "OK" {
+        return None;
+    }
+
+    let formats = meta
+        .pointer("/streamingData/adaptiveFormats")
+        .and_then(|v| v.as_array())?;
+
+    let mut best: Option<(u64, String, Option<u64>)> = None;
+    for fmt in formats {
+        let mime = fmt.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+        if !mime.starts_with("audio/mp4") {
+            continue;
+        }
+        let Some(url) = fmt
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("http"))
+        else {
+            continue;
+        };
+        let bitrate = fmt.get("bitrate").and_then(|v| v.as_u64()).unwrap_or(0);
+        let len = fmt
+            .get("contentLength")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+            .filter(|&n| n > 0);
+
+        if best.as_ref().is_none_or(|(b, _, _)| bitrate > *b) {
+            best = Some((bitrate, url.to_string(), len));
+        }
+    }
+
+    best.map(|(_, url, len)| (url, len))
+}
+
+async fn download_ranged_stream(
+    client: &reqwest::Client,
+    stream_url: &str,
+    content_length: Option<u64>,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>, String> {
+    let Some(total) = content_length.filter(|&n| n > 0) else {
+        let mut req = client.get(stream_url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let res = req
+            .send()
+            .await
+            .map_err(|e| format!("Direct stream request failed: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("Direct stream returned HTTP {}", res.status()));
+        }
+        let bytes = res
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("Failed reading stream: {e}"))?;
+        if bytes.is_empty() {
+            return Err(String::from("Direct stream returned empty body"));
+        }
+        return Ok(bytes);
+    };
+
+    // Request 1 MiB byte-range chunks sequentially over HTTP/2 keepalive to avoid googlevideo's single-GET throttle.
+    let mut out = Vec::with_capacity(total as usize);
+    let sep = if stream_url.contains('?') { '&' } else { '?' };
+    let mut start = 0u64;
+
+    while start < total {
+        let end = (start + STREAM_CHUNK_BYTES - 1).min(total - 1);
+        let chunk_url = format!("{stream_url}{sep}range={start}-{end}");
+        let mut req = client.get(&chunk_url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let res = req
+            .send()
+            .await
+            .map_err(|e| format!("Stream chunk failed: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("Stream chunk returned HTTP {}", res.status()));
+        }
+        let chunk = res
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed reading chunk: {e}"))?;
+        if chunk.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&chunk);
+        start += chunk.len() as u64;
+    }
+
+    if out.is_empty() {
+        return Err(String::from("Stream returned empty audio data"));
+    }
+
+    Ok(out)
+}
+
 async fn fetch_direct_via_yt_dlp(
     client: &reqwest::Client,
     yt_dlp: &PathBuf,
@@ -872,8 +1184,6 @@ async fn fetch_direct_via_yt_dlp(
         AUDIO_FORMAT_SPEC,
         "--no-playlist",
         "--no-warnings",
-        "--extractor-args",
-        "youtube:player_client=android_vr,ios,web",
         "-j",
         &watch_url,
     ])
@@ -900,34 +1210,22 @@ async fn fetch_direct_via_yt_dlp(
         .filter(|s| s.starts_with("http"))
         .ok_or_else(|| String::from("No direct stream URL"))?;
 
-    let mut req = client.get(stream_url);
-    if let Some(headers) = meta.get("http_headers").and_then(|v| v.as_object()) {
-        for (k, v) in headers {
+    let content_length = meta
+        .get("filesize")
+        .or_else(|| meta.get("filesize_approx"))
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0);
+
+    let mut headers = Vec::new();
+    if let Some(obj) = meta.get("http_headers").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
             if let Some(val) = v.as_str() {
-                req = req.header(k.as_str(), val);
+                headers.push((k.clone(), val.to_string()));
             }
         }
     }
 
-    let res = req
-        .send()
-        .await
-        .map_err(|e| format!("Direct stream request failed: {e}"))?;
-    if !res.status().is_success() {
-        return Err(format!("Direct stream returned HTTP {}", res.status()));
-    }
-
-    let bytes = res
-        .bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("Failed reading stream: {e}"))?;
-
-    if bytes.is_empty() {
-        return Err(String::from("Direct stream returned empty body"));
-    }
-
-    Ok(bytes)
+    download_ranged_stream(client, stream_url, content_length, &headers).await
 }
 
 async fn run_yt_dlp_audio(
@@ -1068,6 +1366,41 @@ mod tests {
         assert_eq!(tracks[0].album.as_deref(), Some("Hurry Up, We're Dreaming"));
         assert_eq!(tracks[0].duration_secs, Some(243));
         assert_eq!(tracks[0].thumb_url.as_deref(), Some("https://example.com/226.jpg"));
+    }
+
+    #[test]
+    fn parses_search_suggestions() {
+        let sample = json!({
+            "contents": [{
+                "searchSuggestionsSectionRenderer": {
+                    "contents": [
+                        {
+                            "searchSuggestionRenderer": {
+                                "suggestion": {
+                                    "runs": [{ "text": "ju" }, { "text": "ice wrld" }]
+                                }
+                            }
+                        },
+                        {
+                            "musicResponsiveListItemRenderer": {
+                                "navigationEndpoint": {
+                                    "browseEndpoint": { "browseId": "UCbn0GRdgsQtl9hlV-IqxFGg" }
+                                },
+                                "flexColumns": [
+                                    { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Juice WRLD" }] } } },
+                                    { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "62.4M monthly audience" }] } } }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+
+        let parsed = parse_search_suggestions(&sample);
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(&parsed[0], SearchSuggestion::Query(q) if q == "juice wrld"));
+        assert!(matches!(&parsed[1], SearchSuggestion::Browse(c) if c.title == "Juice WRLD"));
     }
 
     #[tokio::test]

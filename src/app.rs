@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use iced::keyboard::{self, Key, key::Named};
@@ -6,16 +8,19 @@ use iced::widget::{
     Id, button, column, container, image, operation, row, scrollable, slider, space, stack, text,
     text_input,
 };
-use iced::{Alignment, Background, Color, ContentFit, Element, Length, Subscription, Task, Theme};
+use iced::{
+    Alignment, Background, Color, ContentFit, Element, Length, Padding, Subscription, Task, Theme,
+};
 
 use crate::audio::AudioEngine;
 use crate::auth::{self, GoogleSession};
 use crate::icons;
 use crate::style;
 use crate::types::{
-    AppSettings, CollectionCard, MoodPill, PlaybackState, PlaylistPage, RepeatMode, Shelf,
-    ShelfItem, Track, UserPlaylist, format_time, truncate_text,
+    AppSettings, CollectionCard, MoodPill, PlaybackState, PlaylistPage, RepeatMode,
+    SearchSuggestion, Shelf, ShelfItem, Track, UserPlaylist, format_time, truncate_text,
 };
+use crate::updater::{self, UpdateInfo};
 use crate::ytmusic::{self, YtmAuth};
 
 const MAX_CACHED_THUMBS: usize = 400;
@@ -117,6 +122,27 @@ pub enum Message {
         track_idx: usize,
     },
 
+    // Live search suggestions
+    SuggestionsLoaded {
+        seq: u64,
+        result: Result<Vec<SearchSuggestion>, String>,
+    },
+    PickSuggestionQuery(String),
+    PickSuggestionTrack(Track),
+    PickSuggestionBrowse(CollectionCard),
+    DismissSuggestions,
+
+    // App updates
+    CheckForUpdates,
+    UpdateChecked {
+        manual: bool,
+        result: Result<Option<UpdateInfo>, String>,
+    },
+    StartUpdate,
+    UpdateFinished(Result<(), String>),
+    OpenUpdatePage,
+    DismissUpdateModal,
+
     KeyEvent(keyboard::Event),
     Tick,
 }
@@ -170,6 +196,14 @@ pub struct Hum {
     repeat: RepeatMode,
     play_seq: u64,
     status_note: Option<String>,
+    suggestions: Vec<SearchSuggestion>,
+    show_suggestions: bool,
+    suggestion_seq: Arc<AtomicU64>,
+    available_update: Option<UpdateInfo>,
+    show_update_modal: bool,
+    checking_update: bool,
+    updating_app: bool,
+    update_error: Option<String>,
 
     thumbs: HashMap<String, image::Handle>,
     thumb_order: VecDeque<String>,
@@ -235,6 +269,14 @@ impl Hum {
             repeat: RepeatMode::Off,
             play_seq: 0,
             status_note: None,
+            suggestions: Vec::new(),
+            show_suggestions: false,
+            suggestion_seq: Arc::new(AtomicU64::new(0)),
+            available_update: None,
+            show_update_modal: false,
+            checking_update: false,
+            updating_app: false,
+            update_error: None,
             thumbs: HashMap::new(),
             thumb_order: VecDeque::new(),
             thumb_pending: HashSet::new(),
@@ -274,6 +316,21 @@ impl Hum {
         }
         tasks.push(app.fetch_thumbs(boot_thumbs));
 
+        let warm_client = client.clone();
+        tasks.push(Task::perform(
+            async move { ytmusic::warm_visitor_data(&warm_client).await },
+            |()| Message::Tick,
+        ));
+
+        let update_client = client.clone();
+        tasks.push(Task::perform(
+            async move { updater::check_for_updates(&update_client).await },
+            |result| Message::UpdateChecked {
+                manual: false,
+                result,
+            },
+        ));
+
         (app, Task::batch(tasks))
     }
 
@@ -301,23 +358,31 @@ impl Hum {
         match message {
             Message::QueryChanged(q) => {
                 self.query = q;
-                Task::none()
-            }
-            Message::SubmitSearch => {
-                let query = self.query.trim().to_string();
-                if query.is_empty() {
+                let seq = self.suggestion_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                let trimmed = self.query.trim().to_string();
+                if trimmed.chars().count() < 2 {
+                    self.suggestions.clear();
+                    self.show_suggestions = false;
                     return Task::none();
                 }
-                self.loading_page = true;
-                self.page = Page::Search;
-                self.status_note = None;
 
                 let client = self.client.clone();
                 let auth = self.current_ytm_auth();
+                let seq_guard = self.suggestion_seq.clone();
                 Task::perform(
-                    async move { ytmusic::search_all(&client, &query, auth.as_ref()).await },
-                    Message::SearchFinished,
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        if seq_guard.load(Ordering::SeqCst) != seq {
+                            return Ok(Vec::new());
+                        }
+                        ytmusic::fetch_search_suggestions(&client, &trimmed, auth.as_ref()).await
+                    },
+                    move |result| Message::SuggestionsLoaded { seq, result },
                 )
+            }
+            Message::SubmitSearch => {
+                let query = self.query.trim().to_string();
+                self.run_search(query)
             }
             Message::SearchFinished(Ok((tracks, cards))) => {
                 self.loading_page = false;
@@ -374,6 +439,7 @@ impl Hum {
                 self.fetch_thumbs(urls)
             }
             Message::OpenPage(page) => {
+                self.hide_suggestions();
                 if !matches!(self.page, Page::Playlist | Page::UpNext) {
                     self.prev_page = self.page;
                 }
@@ -424,48 +490,7 @@ impl Hum {
                 browse_id,
                 params,
                 as_shelves,
-            } => {
-                if !matches!(self.page, Page::Playlist) {
-                    self.prev_page = self.page;
-                }
-                self.loading_page = true;
-                let client = self.client.clone();
-                let auth = self.current_ytm_auth();
-
-                if as_shelves {
-                    self.page = Page::Playlist;
-                    self.playlist_page = None;
-                    self.browse_shelves.clear();
-                    Task::perform(
-                        async move {
-                            ytmusic::fetch_browse_shelves(
-                                &client,
-                                &browse_id,
-                                params.as_deref(),
-                                auth.as_ref(),
-                            )
-                            .await
-                        },
-                        Message::BrowseShelvesLoaded,
-                    )
-                } else {
-                    self.page = Page::Playlist;
-                    self.playlist_page = None;
-                    self.browse_shelves.clear();
-                    Task::perform(
-                        async move {
-                            ytmusic::fetch_playlist(
-                                &client,
-                                &browse_id,
-                                params.as_deref(),
-                                auth.as_ref(),
-                            )
-                            .await
-                        },
-                        Message::PlaylistLoaded,
-                    )
-                }
-            }
+            } => self.open_browse(browse_id, params, as_shelves),
             Message::BrowseShelvesLoaded(Ok(shelves)) => {
                 self.loading_page = false;
                 let urls = collect_shelf_thumbs(&shelves);
@@ -808,6 +833,8 @@ impl Hum {
                 self.show_sign_in = false;
                 self.show_new_playlist = false;
                 self.add_to_playlist_track = None;
+                self.show_update_modal = false;
+                self.hide_suggestions();
                 Task::none()
             }
             Message::AddTrackToUserPlaylist {
@@ -849,6 +876,8 @@ impl Hum {
                         Key::Named(Named::Space)
                             if !self.show_sign_in
                                 && !self.show_new_playlist
+                                && !self.show_update_modal
+                                && !self.show_suggestions
                                 && self.add_to_playlist_track.is_none() =>
                         {
                             return self.update(Message::TogglePause);
@@ -867,6 +896,131 @@ impl Hum {
                         _ => {}
                     }
                 }
+                Task::none()
+            }
+            Message::SuggestionsLoaded { seq, result } => {
+                if seq != self.suggestion_seq.load(Ordering::SeqCst)
+                    || self.query.trim().chars().count() < 2
+                {
+                    return Task::none();
+                }
+                match result {
+                    Ok(items) => {
+                        let mut urls = Vec::new();
+                        for item in &items {
+                            match item {
+                                SearchSuggestion::Track(t) => {
+                                    if let Some(u) = &t.thumb_url {
+                                        urls.push(u.clone());
+                                    }
+                                }
+                                SearchSuggestion::Browse(c) => {
+                                    if let Some(u) = &c.thumb_url {
+                                        urls.push(u.clone());
+                                    }
+                                }
+                                SearchSuggestion::Query(_) => {}
+                            }
+                        }
+                        self.show_suggestions = !items.is_empty();
+                        self.suggestions = items;
+                        self.fetch_thumbs(urls)
+                    }
+                    Err(_) => Task::none(),
+                }
+            }
+            Message::PickSuggestionQuery(query) => {
+                self.query = query.clone();
+                self.run_search(query)
+            }
+            Message::PickSuggestionTrack(track) => {
+                self.hide_suggestions();
+                self.queue = vec![track];
+                self.start_track(0)
+            }
+            Message::PickSuggestionBrowse(card) => {
+                let as_shelves = card.browse_id.starts_with("UC");
+                self.open_browse(card.browse_id, card.params, as_shelves)
+            }
+            Message::DismissSuggestions => {
+                self.hide_suggestions();
+                Task::none()
+            }
+            Message::CheckForUpdates => {
+                if self.checking_update {
+                    return Task::none();
+                }
+                self.checking_update = true;
+                self.update_error = None;
+                let client = self.client.clone();
+                Task::perform(
+                    async move { updater::check_for_updates(&client).await },
+                    |result| Message::UpdateChecked {
+                        manual: true,
+                        result,
+                    },
+                )
+            }
+            Message::UpdateChecked { manual, result } => {
+                self.checking_update = false;
+                match result {
+                    Ok(Some(info)) => {
+                        self.available_update = Some(info);
+                        self.show_update_modal = true;
+                        self.update_error = None;
+                    }
+                    Ok(None) => {
+                        self.available_update = None;
+                        if manual {
+                            self.status_note = Some(format!(
+                                "Up to date (v{})",
+                                env!("CARGO_PKG_VERSION")
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        if manual {
+                            self.status_note = Some(err);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::StartUpdate => {
+                let Some(url) = self
+                    .available_update
+                    .as_ref()
+                    .and_then(|u| u.exe_download_url.clone())
+                else {
+                    return Task::none();
+                };
+                if self.updating_app {
+                    return Task::none();
+                }
+                self.updating_app = true;
+                self.update_error = None;
+                let client = self.client.clone();
+                Task::perform(
+                    async move { updater::download_and_replace_exe(&client, &url).await },
+                    Message::UpdateFinished,
+                )
+            }
+            Message::UpdateFinished(Ok(())) => {
+                std::process::exit(0);
+            }
+            Message::UpdateFinished(Err(err)) => {
+                self.updating_app = false;
+                self.update_error = Some(err);
+                Task::none()
+            }
+            Message::OpenUpdatePage => {
+                if let Some(info) = &self.available_update {
+                    updater::open_url(&info.html_url);
+                }
+                Task::none()
+            }
+            Message::DismissUpdateModal => {
+                self.show_update_modal = false;
                 Task::none()
             }
             Message::Tick => {
@@ -899,6 +1053,66 @@ impl Hum {
 
                 Task::none()
             }
+        }
+    }
+
+    fn hide_suggestions(&mut self) {
+        self.suggestion_seq.fetch_add(1, Ordering::SeqCst);
+        self.show_suggestions = false;
+        self.suggestions.clear();
+    }
+
+    fn run_search(&mut self, query: String) -> Task<Message> {
+        self.hide_suggestions();
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            return Task::none();
+        }
+        self.loading_page = true;
+        self.page = Page::Search;
+        self.status_note = None;
+
+        let client = self.client.clone();
+        let auth = self.current_ytm_auth();
+        Task::perform(
+            async move { ytmusic::search_all(&client, &query, auth.as_ref()).await },
+            Message::SearchFinished,
+        )
+    }
+
+    fn open_browse(
+        &mut self,
+        browse_id: String,
+        params: Option<String>,
+        as_shelves: bool,
+    ) -> Task<Message> {
+        self.hide_suggestions();
+        if !matches!(self.page, Page::Playlist) {
+            self.prev_page = self.page;
+        }
+        self.loading_page = true;
+        self.page = Page::Playlist;
+        self.playlist_page = None;
+        self.browse_shelves.clear();
+
+        let client = self.client.clone();
+        let auth = self.current_ytm_auth();
+        if as_shelves {
+            Task::perform(
+                async move {
+                    ytmusic::fetch_browse_shelves(&client, &browse_id, params.as_deref(), auth.as_ref())
+                        .await
+                },
+                Message::BrowseShelvesLoaded,
+            )
+        } else {
+            Task::perform(
+                async move {
+                    ytmusic::fetch_playlist(&client, &browse_id, params.as_deref(), auth.as_ref())
+                        .await
+                },
+                Message::PlaylistLoaded,
+            )
         }
     }
 
@@ -1089,14 +1303,34 @@ impl Hum {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        if self.show_sign_in {
-            stack![shell, self.view_sign_in_modal()].into()
+        let base: Element<'_, Message> =
+            if self.show_suggestions && !self.suggestions.is_empty() {
+                let dropdown = container(self.view_search_suggestions())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(Padding {
+                        top: 56.0,
+                        right: 24.0,
+                        bottom: 24.0,
+                        left: 240.0,
+                    });
+                stack![shell, dropdown].into()
+            } else {
+                shell.into()
+            };
+
+        if self.show_update_modal
+            && let Some(info) = &self.available_update
+        {
+            stack![base, self.view_update_modal(info)].into()
+        } else if self.show_sign_in {
+            stack![base, self.view_sign_in_modal()].into()
         } else if self.show_new_playlist {
-            stack![shell, self.view_new_playlist_modal()].into()
+            stack![base, self.view_new_playlist_modal()].into()
         } else if let Some(track) = &self.add_to_playlist_track {
-            stack![shell, self.view_add_to_playlist_modal(track)].into()
+            stack![base, self.view_add_to_playlist_modal(track)].into()
         } else {
-            shell.into()
+            base
         }
     }
 
@@ -2161,6 +2395,29 @@ impl Hum {
         .width(Length::Fill)
         .style(style::modal_card);
 
+        let check_label = if self.checking_update {
+            "Checking..."
+        } else {
+            "Check for updates"
+        };
+        let mut about_actions = row![
+            button(text(check_label).size(12))
+                .on_press_maybe((!self.checking_update).then_some(Message::CheckForUpdates))
+                .padding([7, 14])
+                .style(style::pill_button(false)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        if let Some(info) = &self.available_update {
+            about_actions = about_actions.push(
+                button(text(format!("Update v{} ready", info.version)).size(12))
+                    .on_press(Message::OpenUpdatePage)
+                    .padding([7, 14])
+                    .style(style::pill_button(true)),
+            );
+        }
+
         let about_card = container(
             column![
                 text("About").size(15).color(style::TEXT_PRIMARY),
@@ -2173,6 +2430,8 @@ impl Hum {
                 text("github.com/Hum-fr/Hum  •  hum-fr.github.io")
                     .size(12)
                     .color(style::TEXT_MUTED),
+                space::vertical().height(4),
+                about_actions,
             ]
             .spacing(6),
         )
@@ -2692,6 +2951,170 @@ impl Hum {
         }
 
         icons::user(size * 0.72, fallback_color).into()
+    }
+
+    fn view_search_suggestions(&self) -> Element<'_, Message> {
+        let mut list = column![].spacing(2);
+
+        for item in &self.suggestions {
+            let btn = match item {
+                SearchSuggestion::Query(q) => button(
+                    row![
+                        icons::search(14.0, style::TEXT_MUTED),
+                        text(truncate_text(q, 52))
+                            .size(13)
+                            .color(style::TEXT_PRIMARY),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::PickSuggestionQuery(q.clone())),
+                SearchSuggestion::Track(t) => button(
+                    row![
+                        self.render_thumb(t.thumb_url.as_deref(), 36.0, 4.0),
+                        column![
+                            text(truncate_text(&t.title, 42))
+                                .size(13)
+                                .color(style::TEXT_PRIMARY),
+                            text(format!("Song  •  {}", truncate_text(&t.artist, 36)))
+                                .size(11)
+                                .color(style::TEXT_MUTED),
+                        ]
+                        .spacing(2),
+                        space::horizontal().width(Length::Fill),
+                        icons::play(13.0, style::TEXT_SECONDARY),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::PickSuggestionTrack(t.clone())),
+                SearchSuggestion::Browse(c) => button(
+                    row![
+                        self.render_thumb(c.thumb_url.as_deref(), 36.0, 4.0),
+                        column![
+                            text(truncate_text(&c.title, 42))
+                                .size(13)
+                                .color(style::TEXT_PRIMARY),
+                            text(truncate_text(&c.subtitle, 44))
+                                .size(11)
+                                .color(style::TEXT_MUTED),
+                        ]
+                        .spacing(2),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::PickSuggestionBrowse(c.clone())),
+            };
+
+            list = list.push(
+                btn.padding([8, 10])
+                    .width(Length::Fill)
+                    .style(style::track_row(false)),
+            );
+        }
+
+        let footer = row![
+            space::horizontal().width(Length::Fill),
+            button(text("Close").size(11).color(style::TEXT_MUTED))
+                .on_press(Message::DismissSuggestions)
+                .padding([4, 8])
+                .style(style::track_row(false)),
+        ];
+
+        container(
+            column![
+                container(scrollable(list).width(Length::Fill)).max_height(360),
+                footer,
+            ]
+            .spacing(4),
+        )
+        .width(460)
+        .padding(8)
+        .style(style::modal_card)
+        .into()
+    }
+
+    fn view_update_modal<'a>(&'a self, info: &'a UpdateInfo) -> Element<'a, Message> {
+        let notes = if info.changelog.trim().is_empty() {
+            "New release available on GitHub."
+        } else {
+            info.changelog.as_str()
+        };
+
+        let mut col = column![
+            text(format!("Update available  —  {}", info.tag_name))
+                .size(18)
+                .color(style::TEXT_PRIMARY),
+            text(format!(
+                "You are running v{}. What's new:",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .size(13)
+            .color(style::TEXT_SECONDARY),
+            container(
+                scrollable(
+                    container(text(notes).size(13).color(style::TEXT_PRIMARY))
+                        .padding(12)
+                        .width(Length::Fill),
+                )
+                .width(Length::Fill),
+            )
+            .max_height(240)
+            .width(Length::Fill)
+            .style(style::modal_card),
+        ]
+        .spacing(12);
+
+        if let Some(err) = &self.update_error {
+            col = col.push(text(err).size(12).color(style::YT_RED));
+        }
+
+        let mut actions = row![
+            button(text("View release").size(13))
+                .on_press(Message::OpenUpdatePage)
+                .padding([8, 14])
+                .style(style::pill_button(false)),
+            space::horizontal().width(Length::Fill),
+            button(text("Later").size(13))
+                .on_press(Message::DismissUpdateModal)
+                .padding([8, 16])
+                .style(style::pill_button(false)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        if info.exe_download_url.is_some() {
+            let update_label = if self.updating_app {
+                "Updating..."
+            } else {
+                "Update & restart"
+            };
+            actions = actions.push(
+                button(text(update_label).size(13))
+                    .on_press_maybe((!self.updating_app).then_some(Message::StartUpdate))
+                    .padding([8, 18])
+                    .style(style::pill_button(true)),
+            );
+        }
+
+        col = col.push(actions);
+
+        let modal = container(col)
+            .padding(24)
+            .max_width(480)
+            .style(style::modal_card);
+
+        container(modal)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.72))),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn nav_button<'a>(
