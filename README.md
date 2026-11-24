@@ -6,39 +6,42 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 
 ---
 
-## What's New in v0.1.5
+## What's New in v0.2.0
 
-- **Dynamic Ambient Obsidian UI Redesign** — Real-time palette extraction from playing album art drives ambient background gradients and dynamic player accents, paired with a custom `hum` soundwave brand mark, frosted glass surfaces, collapsible sidebar, and real `<` / `>` Back & Forward page history.
-- **3-Column Quick Picks & Search Hero** — Home Quick Picks now render in a crisp 3-column grid, and Search leads with a **Top result** glass hero card alongside top **Songs**.
-- **Full-Bleed Now Playing & Balanced Player Bar** — Dedicated full-bleed Lyrics / Up Next stage with large cover artwork and spacious clickable synced lyrics, plus a balanced 3-section player bar.
-- **Sub-Second Native Song Loading & Auto-Updater** — Pure-Rust InnerTube + byte-range HTTP/2 streaming, debounced live search preview dropdown, LRCLIB + YTM synced lyrics, and 1-click self-updater.
+- **Sound Lab Audio DSP (`Ctrl+E`)** — Real-time 5-band Biquad Equalizer with 6 built-in presets + vertical sliders, Stereo Studio Reverb, Playback Speed (`0.75x`–`1.50x`), 1-click **Slowed + Reverb** & **Nightcore**, and a soft-fading **Sleep Timer**.
+- **GPU Audio Visualizers & Reactive Ambient Glow** — Live 512-point FFT spectrum analyzer rendering **Bars**, **Wave**, and **Halo** modes on GPU canvas alongside a bass-breathing multi-orb obsidian ambient mesh and Player Bar **MiniMeter**.
+- **Zen Cinema Stage (`Ctrl+Shift+Z`)** — Hides chrome and sidebars for pure glowing cover art, visualizer motion, and large synced lyrics.
+- **Endless Auto-Radio & Queue Reorder** — Automatically discovers and appends matching tracks at the end of a queue (or hit **Radio** on any song), with `↑`/`↓` queue track reordering.
+- **Spotlight Command Palette (`Ctrl+K`) & Refreshed Home** — Instant command & preset runner anywhere in the app, plus Home Vibe chips, a **Jump Back In** hero card, and live toast feedback.
 
 ---
 
 ## Features
 
 - **YouTube Music Browse & Search**
-  - **Home** feed with *Listen again* history, Quick Picks, and curated mixes/albums (personalized when signed in)
+  - **Home** feed with **Jump Back In** hero card, **Quick Vibe** mood chips, *Listen again* history, 3-column Quick Picks, and personalized shelves
   - **Explore** page with Moods & Genres pills, New Releases, and trending shelves
   - **Live Search Preview** — Debounced autocomplete dropdown as you type, showing suggested queries, artists/albums, and directly playable tracks
-  - **Search** across both individual **Songs** and **Playlists & Mixes**
-- **Fast Native Audio Playback**
-  - Direct stream extraction + native Rust HTTP/2 download with `yt-dlp` fallback
-  - Zero-copy `rodio` + `symphonia` decoding with magic-byte MIME hints (`m4a`/AAC, `mp3`, `vorbis`, `flac`, `wav`)
-  - Local disk LRU audio cache (up to 300 MB) and background queue prefetching (`0`–`2` tracks ahead)
-  - Shuffle, Repeat (`Off` / `All` / `One`), volume slider, quick mute toggle, and accurate seeking
-  - Dedicated background audio thread that sleeps completely when idle or paused
+  - **Search** hero with **Top result** frosted card beside top **Songs** and **Playlists & Mixes**
+- **Sound Lab & Real-Time Audio DSP**
+  - Pure-Rust 5-band parametric Biquad EQ (`60Hz`, `230Hz`, `910Hz`, `3.6kHz`, `12kHz`) + soft limiter
+  - Stereo Schroeder Studio Reverb + Playback Speed (`0.75x`–`1.50x`) + 1-click **Slowed + Reverb** and **Nightcore**
+  - **Sleep Timer** (`15m` / `30m` / `45m` / `60m`) with smooth fade-out before pausing
+- **GPU Canvas Visualizers & Zen Stage**
+  - Live 32-band FFT spectrum visualizer (**Bars**, **Wave**, **Halo**, **Off**) + Player Bar **MiniMeter**
+  - Reactive album-art ambient glow mesh & **Zen Cinema** mode
+- **Fast Native Audio Playback & Endless Auto-Radio**
+  - Direct stream extraction + native Rust HTTP/2 chunked streaming with embedded `yt-dlp` fallback
+  - **Endless Auto-Radio** & 1-click Radio seeding from any track, plus queue reordering
+  - Zero-copy `rodio` + `symphonia` decoding, 300 MB disk LRU cache, and background queue prefetching
+  - Dedicated background audio & adaptive tick loop keeping idle CPU near zero
 - **Queue, Live Lyrics & Local Library**
-  - **Up Next** split view with **Queue** & **Lyrics** tabs, synced active-line highlighting, auto-scroll, and click-to-seek
+  - Full-bleed **Now Playing** stage with synced LRCLIB / YouTube Music active-line lyrics, auto-scroll, and click-to-seek
   - **Liked music**, **custom playlists**, and **Listen again** history stored in `%LOCALAPPDATA%\hum\`
 - **Google Account Sync (WebView2)**
-  - 1-click **Sign in** opens an embedded `"Sign in to YouTube Music"` window
-  - Syncs your Google avatar, account name/email, personalized Home feed, YouTube Music playlists, and Liked Music
-- **Settings**
-  - Toggle disk audio cache, inspect cached size & clear cache, configure prefetch depth, update `yt-dlp`, clear listening history, and view saved data paths
+  - 1-click **Sign in** opens an embedded `"Sign in to YouTube Music"` window to sync avatar, Home feed, playlists, and likes
 - **Single-File Portable Releases & Auto-Updater**
-  - Official releases embed `yt-dlp.exe` right inside `hum.exe`
-  - Checks GitHub Releases on startup (or manually in **Settings → About**), shows an update popup with release notes, and performs 1-click in-place `hum.exe` updates & restart
+  - Official releases embed `yt-dlp.exe` right inside `hum.exe` with startup & Settings update detection and 1-click self-update
 
 ---
 
@@ -47,10 +50,16 @@ Most desktop wrappers load the entire `music.youtube.com` web app inside Electro
 | Shortcut | Action |
 | --- | --- |
 | `Space` | Play / Pause |
-| `Ctrl + F` or `Ctrl + K` | Focus search bar |
-| `Ctrl + Right` | Next track |
-| `Ctrl + Left` | Previous track / restart current |
-| `Esc` | Close open modal |
+| `Ctrl + K` | Open Spotlight Command Palette |
+| `Ctrl + F` | Focus search bar |
+| `Ctrl + E` | Toggle Sound Lab (EQ & FX) |
+| `Ctrl + L` | Toggle Live Lyrics |
+| `Ctrl + Shift + S` | Toggle Slowed + Reverb |
+| `Ctrl + Shift + V` | Cycle GPU audio visualizer |
+| `Ctrl + Shift + Z` | Toggle Zen Cinema Mode |
+| `Ctrl + Left / Right` | Previous / Next track |
+| `Shift + Left / Right` | Seek `-10s` / `+10s` |
+| `Esc` | Exit Zen Mode or close modal |
 
 ---
 

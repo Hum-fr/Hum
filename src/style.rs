@@ -1,15 +1,15 @@
 use iced::gradient::Linear;
 use iced::widget::{button, container, slider, text_input};
-use iced::{Background, Border, Color, Gradient, Radians, Theme, color};
+use iced::{Background, Border, Color, Gradient, Radians, Shadow, Theme, Vector, color};
 
 pub const BG_CANVAS: Color = color!(0x090A0F);
-pub const BG_SIDEBAR: Color = Color::from_rgba(0.04, 0.045, 0.065, 0.72);
+pub const BG_SIDEBAR: Color = Color::from_rgba(0.035, 0.04, 0.062, 0.62);
 pub const BG_HEADER: Color = Color::TRANSPARENT;
-pub const BG_PLAYER: Color = Color::from_rgba(0.045, 0.05, 0.07, 0.90);
+pub const BG_PLAYER: Color = Color::from_rgba(0.038, 0.042, 0.065, 0.86);
 pub const BG_CARD: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.045);
 pub const BG_HOVER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.095);
-pub const BG_PILL: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.07);
-pub const BORDER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.09);
+pub const BG_PILL: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.075);
+pub const BORDER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.095);
 pub const TEXT_PRIMARY: Color = color!(0xF5F6FA);
 pub const TEXT_SECONDARY: Color = color!(0xA7ACBA);
 pub const TEXT_MUTED: Color = color!(0x6E7382);
@@ -19,14 +19,16 @@ pub const YT_RED: Color = color!(0xFF3355);
 pub struct CoverPalette {
     pub primary: Color,
     pub secondary: Color,
+    pub tertiary: Color,
     pub accent: Color,
 }
 
 impl Default for CoverPalette {
     fn default() -> Self {
         Self {
-            primary: Color::from_rgb(0.14, 0.08, 0.14),
-            secondary: Color::from_rgb(0.07, 0.10, 0.17),
+            primary: Color::from_rgb(0.16, 0.08, 0.16),
+            secondary: Color::from_rgb(0.07, 0.11, 0.20),
+            tertiary: color!(0x6E56CF),
             accent: YT_RED,
         }
     }
@@ -73,11 +75,11 @@ pub fn extract_cover_palette(bytes: &[u8]) -> CoverPalette {
     // Scale mood colors into deep, readable dark surfaces so white typography stays crisp.
     let mood = |r: f32, g: f32, b: f32, gain: f32| {
         let lum = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(0.05);
-        let scale = (0.24 / lum).min(1.15) * gain;
+        let scale = (0.26 / lum).min(1.25) * gain;
         Color::from_rgb(
-            (r * scale + 0.03).clamp(0.03, 0.34),
-            (g * scale + 0.03).clamp(0.03, 0.30),
-            (b * scale + 0.05).clamp(0.05, 0.38),
+            (r * scale + 0.03).clamp(0.03, 0.38),
+            (g * scale + 0.03).clamp(0.03, 0.34),
+            (b * scale + 0.05).clamp(0.05, 0.42),
         )
     };
 
@@ -86,46 +88,17 @@ pub fn extract_cover_palette(bytes: &[u8]) -> CoverPalette {
         (g1 * 0.8 + 0.20).clamp(0.32, 0.92),
         (b1 * 0.8 + 0.24).clamp(0.38, 0.98),
     );
+    let tertiary = Color::from_rgb(
+        (r2 * 0.85 + 0.24).clamp(0.38, 0.96),
+        (g2 * 0.85 + 0.26).clamp(0.38, 0.96),
+        (b2 * 0.85 + 0.30).clamp(0.44, 1.0),
+    );
 
     CoverPalette {
-        primary: mood(r1, g1, b1, 0.92),
-        secondary: mood(r2, g2, b2, 0.78),
+        primary: mood(r1, g1, b1, 0.96),
+        secondary: mood(r2, g2, b2, 0.84),
+        tertiary,
         accent,
-    }
-}
-
-pub fn ambient_canvas(palette: CoverPalette) -> impl Fn(&Theme) -> container::Style {
-    let top = Color::from_rgba(palette.primary.r, palette.primary.g, palette.primary.b, 0.55);
-    let mid = Color::from_rgb(0.045, 0.05, 0.07);
-    let bot = Color::from_rgba(
-        palette.secondary.r,
-        palette.secondary.g,
-        palette.secondary.b,
-        0.40,
-    );
-    move |_theme| {
-        let grad = Linear::new(Radians(2.45))
-            .add_stop(0.0, top)
-            .add_stop(0.48, mid)
-            .add_stop(1.0, bot);
-        container::Style {
-            background: Some(Background::Gradient(Gradient::Linear(grad))),
-            ..Default::default()
-        }
-    }
-}
-
-pub fn now_playing_canvas(palette: CoverPalette) -> impl Fn(&Theme) -> container::Style {
-    let deep = Color::from_rgb(0.035, 0.04, 0.058);
-    move |_theme| {
-        let grad = Linear::new(Radians(2.2))
-            .add_stop(0.0, palette.primary)
-            .add_stop(0.55, palette.secondary)
-            .add_stop(1.0, deep);
-        container::Style {
-            background: Some(Background::Gradient(Gradient::Linear(grad))),
-            ..Default::default()
-        }
     }
 }
 
@@ -504,6 +477,169 @@ pub fn volume_slider(_theme: &Theme, status: slider::Status) -> slider::Style {
     }
 }
 
+pub fn floating_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.055))),
+        border: Border {
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.11),
+            width: 1.0,
+            radius: 16.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.40),
+            offset: Vector::new(0.0, 10.0),
+            blur_radius: 26.0,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn accent_card(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Gradient(Gradient::Linear(
+            Linear::new(Radians(1.2))
+                .add_stop(0.0, Color::from_rgba(accent.r, accent.g, accent.b, 0.18))
+                .add_stop(1.0, Color::from_rgba(1.0, 1.0, 1.0, 0.045)),
+        ))),
+        border: Border {
+            color: Color::from_rgba(accent.r, accent.g, accent.b, 0.36),
+            width: 1.0,
+            radius: 16.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(accent.r, accent.g, accent.b, 0.18),
+            offset: Vector::new(0.0, 12.0),
+            blur_radius: 30.0,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn cover_glow(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        border: Border {
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.14),
+            width: 1.0,
+            radius: 16.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(accent.r, accent.g, accent.b, 0.35),
+            offset: Vector::new(0.0, 18.0),
+            blur_radius: 44.0,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn toast_banner(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.08, 0.09, 0.14, 0.94))),
+        border: Border {
+            color: Color::from_rgba(accent.r, accent.g, accent.b, 0.55),
+            width: 1.0,
+            radius: 22.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.50),
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn command_modal(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.065, 0.072, 0.105, 0.97))),
+        border: Border {
+            color: Color::from_rgba(accent.r, accent.g, accent.b, 0.35),
+            width: 1.0,
+            radius: 18.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.68),
+            offset: Vector::new(0.0, 22.0),
+            blur_radius: 50.0,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn fx_badge(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(Color::from_rgba(accent.r, accent.g, accent.b, 0.18))),
+        border: Border {
+            color: Color::from_rgba(accent.r, accent.g, accent.b, 0.45),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+pub fn chip_button(active: bool, accent: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let bg = if active {
+            match status {
+                button::Status::Hovered => Color::from_rgba(accent.r, accent.g, accent.b, 0.32),
+                _ => Color::from_rgba(accent.r, accent.g, accent.b, 0.22),
+            }
+        } else {
+            match status {
+                button::Status::Hovered => Color::from_rgba(1.0, 1.0, 1.0, 0.11),
+                button::Status::Pressed => Color::from_rgba(1.0, 1.0, 1.0, 0.16),
+                _ => BG_PILL,
+            }
+        };
+
+        button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: TEXT_PRIMARY,
+            border: Border {
+                color: if active {
+                    Color::from_rgba(accent.r, accent.g, accent.b, 0.72)
+                } else {
+                    BORDER
+                },
+                width: 1.0,
+                radius: 18.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+pub fn eq_slider(accent: Color) -> impl Fn(&Theme, slider::Status) -> slider::Style {
+    move |_theme, status| {
+        let handle_radius = match status {
+            slider::Status::Hovered | slider::Status::Dragged => 7.0,
+            slider::Status::Active => 5.5,
+        };
+
+        slider::Style {
+            rail: slider::Rail {
+                backgrounds: (
+                    Background::Color(accent),
+                    Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.16)),
+                ),
+                width: 4.0,
+                border: Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
+            },
+            handle: slider::Handle {
+                shape: slider::HandleShape::Circle {
+                    radius: handle_radius,
+                },
+                background: Background::Color(TEXT_PRIMARY),
+                border_width: 1.5,
+                border_color: accent,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +650,7 @@ mod tests {
         let fallback = CoverPalette::default();
         assert_eq!(palette.primary, fallback.primary);
         assert_eq!(palette.secondary, fallback.secondary);
+        assert_eq!(palette.tertiary, fallback.tertiary);
         assert_eq!(palette.accent, fallback.accent);
     }
 }

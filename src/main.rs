@@ -3,10 +3,12 @@
 mod app;
 mod audio;
 mod auth;
+mod dsp;
 mod icons;
 mod style;
 mod types;
 mod updater;
+mod visualizer;
 mod webview_login;
 mod ytmusic;
 
@@ -26,8 +28,8 @@ fn main() -> iced::Result {
         .subscription(Hum::subscription)
         .theme(|_: &Hum| style::app_theme())
         .window(window::Settings {
-            size: Size::new(1160.0, 740.0),
-            min_size: Some(Size::new(860.0, 560.0)),
+            size: Size::new(1240.0, 780.0),
+            min_size: Some(Size::new(900.0, 580.0)),
             ..Default::default()
         })
         .centered()

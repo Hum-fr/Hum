@@ -1,12 +1,12 @@
 [package]
 name = "hum"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 description = "Lightweight desktop YouTube Music player"
 license = "MIT"
 
 [dependencies]
-iced = { version = "0.14", features = ["tokio", "image", "svg"] }
+iced = { version = "0.14", features = ["tokio", "image", "svg", "canvas"] }
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp4", "mp3", "vorbis"] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "form", "charset", "http2"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

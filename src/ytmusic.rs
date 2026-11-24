@@ -1559,6 +1559,92 @@ fn parse_lrc_timestamp(tag: &str) -> Option<u64> {
     Some((mins * 60 + secs) * 1000 + frac_ms)
 }
 
+pub async fn fetch_radio_tracks(
+    client: &reqwest::Client,
+    video_id: &str,
+    auth: Option<&YtmAuth>,
+) -> Result<Vec<Track>, String> {
+    let body = post_innertube(
+        client,
+        NEXT_URL,
+        json!({
+            "context": client_context(),
+            "videoId": video_id,
+            "playlistId": format!("RDAMVM{video_id}"),
+            "isAudioOnly": true,
+        }),
+        auth,
+    )
+    .await?;
+
+    let tracks = parse_radio_tracks(&body, video_id);
+    if tracks.is_empty() {
+        Err(String::from("No related tracks found for radio"))
+    } else {
+        Ok(tracks)
+    }
+}
+
+pub fn parse_radio_tracks(root: &Value, seed_id: &str) -> Vec<Track> {
+    let mut tracks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(seed_id.to_string());
+
+    let Some(panel) = find_key(root, "playlistPanelRenderer") else {
+        return tracks;
+    };
+    let Some(contents) = panel.get("contents").and_then(|v| v.as_array()) else {
+        return tracks;
+    };
+
+    for item in contents {
+        let Some(renderer) = item.get("playlistPanelVideoRenderer") else {
+            continue;
+        };
+        let Some(id) = renderer.get("videoId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let Some(title) = runs_text(renderer.pointer("/title/runs")) else {
+            continue;
+        };
+        let raw_byline = runs_text(renderer.pointer("/longBylineText/runs"))
+            .or_else(|| runs_text(renderer.pointer("/shortBylineText/runs")))
+            .unwrap_or_else(|| String::from("YouTube Music"));
+        let artist = extract_primary_artist(&raw_byline);
+        let artist = if artist.is_empty() {
+            String::from("YouTube Music")
+        } else {
+            artist
+        };
+        let duration_label = runs_text(renderer.pointer("/lengthText/runs"))
+            .unwrap_or_else(|| String::from("--:--"));
+        let duration_secs = parse_duration_secs(&duration_label);
+        let thumb_url = pick_thumbnail(
+            renderer.pointer("/thumbnail/thumbnails").and_then(|v| v.as_array()),
+            226,
+        );
+
+        tracks.push(Track {
+            id: id.to_string(),
+            title,
+            artist,
+            album: None,
+            duration_label,
+            duration_secs,
+            thumb_url,
+        });
+
+        if tracks.len() >= 20 {
+            break;
+        }
+    }
+
+    tracks
+}
+
 async fn fetch_ytm_lyrics(
     client: &reqwest::Client,
     video_id: &str,
@@ -1795,6 +1881,59 @@ mod tests {
         let (t2, a2) = clean_track_meta("wheredoistart", "Song • Ken Carson");
         assert_eq!(t2, "wheredoistart");
         assert_eq!(a2, "Ken Carson");
+    }
+
+    #[test]
+    fn parses_radio_tracks() {
+        let sample = json!({
+            "contents": {
+                "singleColumnMusicWatchNextResultsRenderer": {
+                    "tabbedRenderer": {
+                        "watchNextTabbedResultsRenderer": {
+                            "tabs": [{
+                                "tabRenderer": {
+                                    "content": {
+                                        "musicQueueRenderer": {
+                                            "content": {
+                                                "playlistPanelRenderer": {
+                                                    "contents": [
+                                                        {
+                                                            "playlistPanelVideoRenderer": {
+                                                                "videoId": "seed_vid",
+                                                                "title": { "runs": [{ "text": "Seed Song" }] },
+                                                                "longBylineText": { "runs": [{ "text": "Artist One" }] },
+                                                                "lengthText": { "runs": [{ "text": "3:15" }] }
+                                                            }
+                                                        },
+                                                        {
+                                                            "playlistPanelVideoRenderer": {
+                                                                "videoId": "next_vid_1",
+                                                                "title": { "runs": [{ "text": "Night Drive" }] },
+                                                                "longBylineText": { "runs": [{ "text": "Kavinsky" }, { "text": " • " }, { "text": "OutRun" }, { "text": " • " }, { "text": "2013" }] },
+                                                                "lengthText": { "runs": [{ "text": "4:18" }] },
+                                                                "thumbnail": { "thumbnails": [{ "url": "https://example.com/226.jpg", "width": 226 }] }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+
+        let tracks = parse_radio_tracks(&sample, "seed_vid");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, "next_vid_1");
+        assert_eq!(tracks[0].title, "Night Drive");
+        assert_eq!(tracks[0].artist, "Kavinsky");
+        assert_eq!(tracks[0].duration_secs, Some(258));
+        assert_eq!(tracks[0].thumb_url.as_deref(), Some("https://example.com/226.jpg"));
     }
 
     #[tokio::test]

@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 
-use crate::types::{AudioSnapshot, PlaybackState};
+use crate::dsp::{DspSource, SharedDspState};
+use crate::types::{AudioSnapshot, DspConfig, PlaybackState, SpectrumFrame};
 
 #[derive(Clone)]
 struct SharedBytes(Arc<[u8]>);
@@ -24,6 +25,7 @@ enum Command {
     TogglePause,
     Seek(Duration),
     SetVolume(f32),
+    SetSpeed(f32),
     Stop,
 }
 
@@ -31,20 +33,49 @@ enum Command {
 pub struct AudioEngine {
     tx: Sender<Command>,
     snapshot: Arc<Mutex<AudioSnapshot>>,
+    dsp_state: Arc<SharedDspState>,
+    spectrum: Arc<Mutex<SpectrumFrame>>,
 }
 
 impl AudioEngine {
-    pub fn start(initial_volume: f32) -> Self {
+    pub fn start(initial_volume: f32, initial_dsp: DspConfig) -> Self {
         let (tx, rx) = mpsc::channel();
         let snapshot = Arc::new(Mutex::new(AudioSnapshot::default()));
+        let dsp_state = Arc::new(SharedDspState::new(initial_dsp));
+        let spectrum = Arc::new(Mutex::new(SpectrumFrame::default()));
         let worker_snapshot = Arc::clone(&snapshot);
+        let worker_dsp = Arc::clone(&dsp_state);
+        let worker_spectrum = Arc::clone(&spectrum);
 
         thread::Builder::new()
             .name("hum-audio".into())
-            .spawn(move || audio_loop(rx, worker_snapshot, initial_volume.clamp(0.0, 1.0)))
+            .spawn(move || {
+                audio_loop(
+                    rx,
+                    worker_snapshot,
+                    worker_dsp,
+                    worker_spectrum,
+                    initial_volume.clamp(0.0, 1.0),
+                    initial_dsp.speed.clamp(0.75, 1.50),
+                )
+            })
             .expect("failed to spawn audio thread");
 
-        Self { tx, snapshot }
+        Self {
+            tx,
+            snapshot,
+            dsp_state,
+            spectrum,
+        }
+    }
+
+    pub fn set_dsp(&self, cfg: DspConfig) {
+        self.dsp_state.update(cfg);
+        let _ = self.tx.send(Command::SetSpeed(cfg.speed.clamp(0.75, 1.50)));
+    }
+
+    pub fn spectrum(&self) -> SpectrumFrame {
+        *self.spectrum.lock().unwrap()
     }
 
     pub fn play_bytes(&self, seq: u64, bytes: Vec<u8>) {
@@ -143,7 +174,10 @@ fn build_fast_decoder(bytes: Vec<u8>) -> Result<Decoder<Cursor<SharedBytes>>, ro
 fn audio_loop(
     rx: mpsc::Receiver<Command>,
     snapshot: Arc<Mutex<AudioSnapshot>>,
+    dsp_state: Arc<SharedDspState>,
+    spectrum: Arc<Mutex<SpectrumFrame>>,
     initial_volume: f32,
+    initial_speed: f32,
 ) {
     let sink_handle = match DeviceSinkBuilder::open_default_sink() {
         Ok(handle) => handle,
@@ -158,12 +192,14 @@ fn audio_loop(
     let mut has_track = false;
     let mut current_seq: u64 = 0;
     let mut volume = initial_volume;
+    let mut speed = initial_speed;
     player.set_volume(volume);
+    player.set_speed(speed);
 
     loop {
         // Block completely when idle or paused so background CPU stays near zero.
         let msg = if has_track && !player.is_paused() {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(cmd) => Some(cmd),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -180,11 +216,15 @@ fn audio_loop(
                 Command::PlayBytes { seq, bytes } => {
                     current_seq = seq;
                     player.clear();
+                    *spectrum.lock().unwrap() = SpectrumFrame::default();
                     match build_fast_decoder(bytes) {
                         Ok(source) => {
                             let decoded_duration = source.total_duration();
+                            let processed =
+                                DspSource::new(source, Arc::clone(&dsp_state), Arc::clone(&spectrum));
                             player.set_volume(volume);
-                            player.append(source);
+                            player.set_speed(speed);
+                            player.append(processed);
                             player.play();
                             has_track = true;
                             let mut guard = snapshot.lock().unwrap();
@@ -224,9 +264,14 @@ fn audio_loop(
                     volume = vol;
                     player.set_volume(vol);
                 }
+                Command::SetSpeed(s) => {
+                    speed = s.clamp(0.75, 1.50);
+                    player.set_speed(speed);
+                }
                 Command::Stop => {
                     player.clear();
                     has_track = false;
+                    *spectrum.lock().unwrap() = SpectrumFrame::default();
                     let mut guard = snapshot.lock().unwrap();
                     guard.state = PlaybackState::Stopped;
                     guard.position = Duration::ZERO;
@@ -241,6 +286,7 @@ fn audio_loop(
             if guard.seq == current_seq {
                 if player.empty() {
                     has_track = false;
+                    *spectrum.lock().unwrap() = SpectrumFrame::default();
                     guard.state = PlaybackState::Stopped;
                     guard.position = Duration::ZERO;
                     guard.finished_track = true;

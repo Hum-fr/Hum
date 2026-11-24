@@ -217,3 +217,83 @@ pub fn hum_mark<'a>(size: f32, color: Color) -> svg::Svg<'a> {
         color,
     )
 }
+
+pub fn sliders<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn radio<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn sparkles<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn moon<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn maximize<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn minimize<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn command<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3Z"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn arrow_up<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn arrow_down<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#,
+        size,
+        color,
+    )
+}
+
+pub fn wave<'a>(size: f32, color: Color) -> svg::Svg<'a> {
+    icon(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12c2.2-5 4.3-5 6.5 0s4.3 5 6.5 0 4.3-5 7 0"/></svg>"#,
+        size,
+        color,
+    )
+}

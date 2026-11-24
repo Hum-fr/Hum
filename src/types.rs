@@ -78,12 +78,122 @@ pub struct UserPlaylist {
     pub tracks: Vec<Track>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VisualizerMode {
+    #[default]
+    Bars,
+    Wave,
+    Halo,
+    Off,
+}
+
+impl VisualizerMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Bars => Self::Wave,
+            Self::Wave => Self::Halo,
+            Self::Halo => Self::Off,
+            Self::Off => Self::Bars,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bars => "Bars",
+            Self::Wave => "Wave",
+            Self::Halo => "Halo",
+            Self::Off => "Off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EqPreset {
+    #[default]
+    Flat,
+    BassBoost,
+    LateNight,
+    Vocal,
+    Electronic,
+    LoFi,
+    Custom,
+}
+
+impl EqPreset {
+    pub fn gains(self) -> [f32; 5] {
+        match self {
+            Self::Flat | Self::Custom => [0.0, 0.0, 0.0, 0.0, 0.0],
+            Self::BassBoost => [6.5, 3.5, 0.0, 1.0, 1.5],
+            Self::LateNight => [-2.5, 1.0, 2.5, 1.5, -2.0],
+            Self::Vocal => [-1.5, 0.5, 4.5, 3.5, 1.0],
+            Self::Electronic => [5.0, 2.0, -1.0, 3.0, 4.5],
+            Self::LoFi => [3.5, 2.5, -1.0, -3.5, -6.0],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "Flat",
+            Self::BassBoost => "Bass Boost",
+            Self::LateNight => "Late Night",
+            Self::Vocal => "Vocal",
+            Self::Electronic => "Electronic",
+            Self::LoFi => "Lo-Fi",
+            Self::Custom => "Custom",
+        }
+    }
+
+    pub fn all_presets() -> &'static [EqPreset] {
+        &[
+            Self::Flat,
+            Self::BassBoost,
+            Self::LateNight,
+            Self::Vocal,
+            Self::Electronic,
+            Self::LoFi,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DspConfig {
+    pub eq_gains: [f32; 5],
+    pub reverb_mix: f32,
+    pub speed: f32,
+}
+
+impl Default for DspConfig {
+    fn default() -> Self {
+        Self {
+            eq_gains: [0.0; 5],
+            reverb_mix: 0.0,
+            speed: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpectrumFrame {
+    pub bands: [f32; 32],
+    pub peaks: [f32; 32],
+    pub bass: f32,
+    pub rms: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub default_volume: f32,
     pub disk_audio_cache: bool,
     pub prefetch_ahead: usize,
+    pub eq_preset: EqPreset,
+    pub eq_gains: [f32; 5],
+    pub reverb_mix: f32,
+    pub playback_speed: f32,
+    pub visualizer: VisualizerMode,
+    pub auto_radio: bool,
+    pub ambient_glow: bool,
 }
 
 impl Default for AppSettings {
@@ -92,6 +202,13 @@ impl Default for AppSettings {
             default_volume: 0.85,
             disk_audio_cache: true,
             prefetch_ahead: 2,
+            eq_preset: EqPreset::Flat,
+            eq_gains: [0.0; 5],
+            reverb_mix: 0.0,
+            playback_speed: 1.0,
+            visualizer: VisualizerMode::Bars,
+            auto_radio: true,
+            ambient_glow: true,
         }
     }
 }

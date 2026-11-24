@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::f32::consts::TAU;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
-    Id, button, column, container, image, operation, row, scrollable, slider, space, stack, text,
-    text_input,
+    Id, button, canvas, column, container, image, operation, row, scrollable, slider, space,
+    stack, text, text_input, vertical_slider,
 };
 use iced::{
     Alignment, Background, Color, ContentFit, Element, Length, Padding, Subscription, Task, Theme,
@@ -14,14 +15,16 @@ use iced::{
 
 use crate::audio::AudioEngine;
 use crate::auth::{self, GoogleSession};
+use crate::dsp::EQ_BAND_LABELS;
 use crate::icons;
 use crate::style;
 use crate::types::{
-    AppSettings, CollectionCard, MoodPill, PlaybackState, PlaylistPage, RepeatMode,
-    SearchSuggestion, Shelf, ShelfItem, Track, TrackLyrics, UserPlaylist, format_time,
-    truncate_text,
+    AppSettings, CollectionCard, DspConfig, EqPreset, MoodPill, PlaybackState, PlaylistPage,
+    RepeatMode, SearchSuggestion, Shelf, ShelfItem, SpectrumFrame, Track, TrackLyrics,
+    UserPlaylist, VisualizerMode, format_time, truncate_text,
 };
 use crate::updater::{self, UpdateInfo};
+use crate::visualizer::{AmbientBackdrop, AudioVisualizer, MiniMeter};
 use crate::ytmusic::{self, YtmAuth};
 
 const MAX_CACHED_THUMBS: usize = 400;
@@ -34,6 +37,7 @@ pub enum Page {
     Search,
     Library,
     UpNext,
+    SoundLab,
     Settings,
     Playlist,
     UserPlaylist(usize),
@@ -43,6 +47,29 @@ pub enum Page {
 pub enum UpNextTab {
     Queue,
     Lyrics,
+    SoundLab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteAction {
+    TogglePause,
+    NextTrack,
+    PrevTrack,
+    OpenHome,
+    OpenExplore,
+    OpenLibrary,
+    OpenSoundLab,
+    OpenLyrics,
+    OpenQueue,
+    OpenSettings,
+    CycleVisualizer,
+    ToggleZenMode,
+    ToggleSlowedReverb,
+    ToggleNightcore,
+    ToggleAutoRadio,
+    StartRadio,
+    SetSleep(Option<u64>),
+    SelectPreset(EqPreset),
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +190,41 @@ pub enum Message {
     },
     SeekToMs(u64),
 
+    // Sound Lab DSP & Visualizers
+    SetEqBand(usize, f32),
+    SelectEqPreset(EqPreset),
+    SetPlaybackSpeed(f32),
+    SetReverbMix(f32),
+    ToggleSlowedReverb,
+    ToggleNightcore,
+    ResetSoundLab,
+    CycleVisualizer,
+    SetVisualizer(VisualizerMode),
+    ToggleZenMode,
+    ToggleAmbientGlow,
+
+    // Endless Auto-Radio & Queue control
+    StartRadio(Track),
+    RadioLoaded {
+        seed_id: String,
+        auto: bool,
+        result: Result<Vec<Track>, String>,
+    },
+    ToggleAutoRadio,
+    MoveQueueItem {
+        from: usize,
+        to: usize,
+    },
+
+    // Sleep timer & Spotlight Command Palette
+    SetSleepTimer(Option<u64>),
+    OpenCommandPalette,
+    CloseCommandPalette,
+    CommandPaletteChanged(String),
+    CommandPaletteSubmit,
+    RunPaletteAction(PaletteAction),
+    QuickVibe(String),
+
     KeyEvent(keyboard::Event),
     Tick,
 }
@@ -190,6 +252,21 @@ pub struct Hum {
     has_yt_dlp: bool,
     settings: AppSettings,
     cache_stats: (usize, u64),
+
+    dsp: DspConfig,
+    eq_preset: EqPreset,
+    visualizer: VisualizerMode,
+    display_spectrum: SpectrumFrame,
+    anim_phase: f32,
+    zen_mode: bool,
+    radio_loading: bool,
+    sleep_deadline: Option<Instant>,
+    sleep_target_mins: u64,
+    sleep_restore_vol: Option<f32>,
+    show_command_palette: bool,
+    palette_query: String,
+    palette_input_id: Id,
+    toast: Option<(String, Instant)>,
 
     home_shelves: Vec<Shelf>,
     explore_shelves: Vec<Shelf>,
@@ -249,6 +326,13 @@ impl Hum {
         let google_session = auth::load_google_session();
         let ytm_auth = google_session.as_ref().and_then(GoogleSession::ytm_auth);
         let settings = auth::load_settings();
+        let dsp = DspConfig {
+            eq_gains: settings.eq_gains,
+            reverb_mix: settings.reverb_mix.clamp(0.0, 1.0),
+            speed: settings.playback_speed.clamp(0.75, 1.50),
+        };
+        let eq_preset = settings.eq_preset;
+        let visualizer = settings.visualizer;
         let liked_tracks = auth::load_liked_tracks();
         let liked_ids = liked_tracks.iter().map(|t| t.id.clone()).collect();
         let user_playlists = auth::load_user_playlists();
@@ -258,7 +342,7 @@ impl Hum {
 
         let mut app = Self {
             client: client.clone(),
-            audio: AudioEngine::start(settings.default_volume),
+            audio: AudioEngine::start(settings.default_volume, dsp),
             search_id: Id::new("search_bar"),
             google_session: google_session.clone(),
             show_sign_in: false,
@@ -276,6 +360,20 @@ impl Hum {
             has_yt_dlp,
             settings: settings.clone(),
             cache_stats,
+            dsp,
+            eq_preset,
+            visualizer,
+            display_spectrum: SpectrumFrame::default(),
+            anim_phase: 0.0,
+            zen_mode: false,
+            radio_loading: false,
+            sleep_deadline: None,
+            sleep_target_mins: 0,
+            sleep_restore_vol: None,
+            show_command_palette: false,
+            palette_query: String::new(),
+            palette_input_id: Id::new("command_palette_input"),
+            toast: None,
             home_shelves: Vec::new(),
             explore_shelves: Vec::new(),
             browse_shelves: Vec::new(),
@@ -386,10 +484,16 @@ impl Hum {
     pub fn subscription(&self) -> Subscription<Message> {
         let keys = keyboard::listen().map(Message::KeyEvent);
         match self.playback {
-            PlaybackState::Playing | PlaybackState::Loading => Subscription::batch([
-                keys,
-                iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
-            ]),
+            PlaybackState::Playing | PlaybackState::Loading => {
+                let high_fps = (self.page == Page::UpNext || self.page == Page::SoundLab)
+                    && (self.visualizer != VisualizerMode::Off || self.settings.ambient_glow);
+                let interval = if high_fps {
+                    Duration::from_millis(33)
+                } else {
+                    Duration::from_millis(125)
+                };
+                Subscription::batch([keys, iced::time::every(interval).map(|_| Message::Tick)])
+            }
             PlaybackState::Paused | PlaybackState::Stopped => keys,
         }
     }
@@ -525,12 +629,19 @@ impl Hum {
                     self.queue = tracks;
                     return self.start_track(0);
                 }
+                let single_seed = (tracks.len() == 1 && self.settings.auto_radio)
+                    .then(|| tracks[0].clone());
                 self.queue = tracks;
-                self.start_track(index)
+                let play_task = self.start_track(index);
+                if let Some(seed) = single_seed {
+                    Task::batch([play_task, self.trigger_radio(seed, false)])
+                } else {
+                    play_task
+                }
             }
             Message::QueueTrack(track) => {
                 self.queue.push(track.clone());
-                self.status_note = Some(format!("Added \"{}\" to queue", truncate_text(&track.title, 28)));
+                self.show_toast(format!("Queued \"{}\"", truncate_text(&track.title, 26)));
                 Task::none()
             }
             Message::RemoveFromQueue(idx) => {
@@ -838,6 +949,8 @@ impl Hum {
                 Task::none()
             }
             Message::CloseModals => {
+                self.zen_mode = false;
+                self.show_command_palette = false;
                 self.show_sign_in = false;
                 self.show_new_playlist = false;
                 self.add_to_playlist_track = None;
@@ -881,25 +994,76 @@ impl Hum {
                         Key::Named(Named::Escape) => {
                             return self.update(Message::CloseModals);
                         }
+                        Key::Character(ref ch) if modifiers.command() && ch == "k" => {
+                            if self.show_command_palette {
+                                self.show_command_palette = false;
+                                return Task::none();
+                            }
+                            self.show_command_palette = true;
+                            self.palette_query.clear();
+                            self.hide_suggestions();
+                            return operation::focus(self.palette_input_id.clone());
+                        }
+                        Key::Character(ref ch) if modifiers.command() && ch == "f" => {
+                            self.show_command_palette = false;
+                            return operation::focus(self.search_id.clone());
+                        }
+                        Key::Character(ref ch) if modifiers.command() && modifiers.shift() && ch == "v" => {
+                            return self.update(Message::CycleVisualizer);
+                        }
+                        Key::Character(ref ch) if modifiers.command() && modifiers.shift() && ch == "z" => {
+                            return self.update(Message::ToggleZenMode);
+                        }
+                        Key::Character(ref ch) if modifiers.command() && modifiers.shift() && ch == "s" => {
+                            return self.update(Message::ToggleSlowedReverb);
+                        }
+                        Key::Character(ref ch) if modifiers.command() && ch == "e" => {
+                            let next = if self.page == Page::SoundLab {
+                                self.prev_page
+                            } else {
+                                Page::SoundLab
+                            };
+                            return self.update(Message::OpenPage(next));
+                        }
+                        Key::Character(ref ch) if modifiers.command() && ch == "l" => {
+                            return self.update(Message::OpenLyricsPage);
+                        }
+                        Key::Character(ref ch) if modifiers.command() && ch == "m" => {
+                            return self.update(Message::ToggleMute);
+                        }
                         Key::Named(Named::Space)
                             if !self.show_sign_in
                                 && !self.show_new_playlist
                                 && !self.show_update_modal
                                 && !self.show_suggestions
+                                && !self.show_command_palette
                                 && self.add_to_playlist_track.is_none() =>
                         {
                             return self.update(Message::TogglePause);
-                        }
-                        Key::Character(ref ch)
-                            if modifiers.command() && (ch == "f" || ch == "k") =>
-                        {
-                            return operation::focus(self.search_id.clone());
                         }
                         Key::Named(Named::ArrowRight) if modifiers.command() => {
                             return self.update(Message::NextTrack);
                         }
                         Key::Named(Named::ArrowLeft) if modifiers.command() => {
                             return self.update(Message::PrevTrack);
+                        }
+                        Key::Named(Named::ArrowRight)
+                            if modifiers.shift()
+                                && !self.show_command_palette
+                                && !self.show_new_playlist
+                                && !self.show_suggestions =>
+                        {
+                            let secs = (self.position.as_secs() + 10) * 1000;
+                            return self.update(Message::SeekToMs(secs));
+                        }
+                        Key::Named(Named::ArrowLeft)
+                            if modifiers.shift()
+                                && !self.show_command_palette
+                                && !self.show_new_playlist
+                                && !self.show_suggestions =>
+                        {
+                            let secs = self.position.as_secs().saturating_sub(10) * 1000;
+                            return self.update(Message::SeekToMs(secs));
                         }
                         _ => {}
                     }
@@ -943,8 +1107,13 @@ impl Hum {
             }
             Message::PickSuggestionTrack(track) => {
                 self.hide_suggestions();
-                self.queue = vec![track];
-                self.start_track(0)
+                self.queue = vec![track.clone()];
+                let play_task = self.start_track(0);
+                if self.settings.auto_radio {
+                    Task::batch([play_task, self.trigger_radio(track, false)])
+                } else {
+                    play_task
+                }
             }
             Message::PickSuggestionBrowse(card) => {
                 let as_shelves = card.browse_id.starts_with("UC");
@@ -1110,7 +1279,284 @@ impl Hum {
                 self.last_active_lyric = None;
                 self.sync_lyrics_scroll()
             }
+            Message::SetEqBand(band, db) => {
+                if band < 5 {
+                    self.dsp.eq_gains[band] = db.clamp(-12.0, 12.0);
+                    self.eq_preset = EqPreset::Custom;
+                    self.apply_dsp();
+                }
+                Task::none()
+            }
+            Message::SelectEqPreset(preset) => {
+                self.eq_preset = preset;
+                if preset != EqPreset::Custom {
+                    self.dsp.eq_gains = preset.gains();
+                }
+                self.apply_dsp();
+                self.show_toast(format!("EQ: {}", preset.label()));
+                Task::none()
+            }
+            Message::SetPlaybackSpeed(speed) => {
+                self.dsp.speed = speed.clamp(0.75, 1.50);
+                self.apply_dsp();
+                Task::none()
+            }
+            Message::SetReverbMix(mix) => {
+                self.dsp.reverb_mix = mix.clamp(0.0, 1.0);
+                self.apply_dsp();
+                Task::none()
+            }
+            Message::ToggleSlowedReverb => {
+                if self.is_slowed_reverb() {
+                    self.dsp.speed = 1.0;
+                    self.dsp.reverb_mix = 0.0;
+                    self.show_toast("Slowed + Reverb disabled");
+                } else {
+                    self.dsp.speed = 0.85;
+                    self.dsp.reverb_mix = 0.42;
+                    self.show_toast("Slowed + Reverb enabled");
+                }
+                self.apply_dsp();
+                Task::none()
+            }
+            Message::ToggleNightcore => {
+                if self.is_nightcore() {
+                    self.dsp.speed = 1.0;
+                    self.dsp.reverb_mix = 0.0;
+                    self.show_toast("Nightcore disabled");
+                } else {
+                    self.dsp.speed = 1.22;
+                    self.dsp.reverb_mix = 0.08;
+                    self.show_toast("Nightcore enabled");
+                }
+                self.apply_dsp();
+                Task::none()
+            }
+            Message::ResetSoundLab => {
+                self.eq_preset = EqPreset::Flat;
+                self.dsp = DspConfig::default();
+                self.apply_dsp();
+                self.show_toast("Sound Lab reset to flat");
+                Task::none()
+            }
+            Message::CycleVisualizer => {
+                self.visualizer = self.visualizer.next();
+                self.settings.visualizer = self.visualizer;
+                auth::save_settings(&self.settings);
+                self.show_toast(format!("Visualizer: {}", self.visualizer.label()));
+                Task::none()
+            }
+            Message::SetVisualizer(mode) => {
+                self.visualizer = mode;
+                self.settings.visualizer = mode;
+                auth::save_settings(&self.settings);
+                self.show_toast(format!("Visualizer: {}", mode.label()));
+                Task::none()
+            }
+            Message::ToggleZenMode => {
+                if self.zen_mode {
+                    self.zen_mode = false;
+                } else {
+                    if self.page != Page::UpNext {
+                        self.navigate_to(Page::UpNext);
+                    }
+                    self.zen_mode = true;
+                }
+                Task::none()
+            }
+            Message::ToggleAmbientGlow => {
+                self.settings.ambient_glow = !self.settings.ambient_glow;
+                auth::save_settings(&self.settings);
+                self.show_toast(if self.settings.ambient_glow {
+                    "Ambient reactive glow ON"
+                } else {
+                    "Ambient reactive glow OFF"
+                });
+                Task::none()
+            }
+            Message::StartRadio(track) => {
+                self.show_toast(format!("Starting radio from \"{}\"", truncate_text(&track.title, 22)));
+                self.trigger_radio(track, false)
+            }
+            Message::RadioLoaded {
+                seed_id,
+                auto,
+                result,
+            } => {
+                self.radio_loading = false;
+                match result {
+                    Ok(tracks) => {
+                        let existing: HashSet<String> =
+                            self.queue.iter().map(|t| t.id.clone()).collect();
+                        let mut urls = Vec::new();
+                        let start_new_idx = self.queue.len();
+                        let mut added = 0usize;
+                        for track in tracks {
+                            if track.id != seed_id && !existing.contains(&track.id) {
+                                if let Some(u) = &track.thumb_url {
+                                    urls.push(u.clone());
+                                }
+                                self.queue.push(track);
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            let thumb_task = self.fetch_thumbs(urls);
+                            if auto {
+                                return Task::batch([thumb_task, self.start_track(start_new_idx)]);
+                            }
+                            self.show_toast(format!("Added {added} radio tracks to queue"));
+                            return thumb_task;
+                        }
+                        Task::none()
+                    }
+                    Err(err) => {
+                        if !auto {
+                            self.show_toast(err);
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::ToggleAutoRadio => {
+                self.settings.auto_radio = !self.settings.auto_radio;
+                auth::save_settings(&self.settings);
+                self.show_toast(if self.settings.auto_radio {
+                    "Endless Auto-Radio ON"
+                } else {
+                    "Endless Auto-Radio OFF"
+                });
+                Task::none()
+            }
+            Message::MoveQueueItem { from, to } => {
+                if from < self.queue.len() && to < self.queue.len() && from != to {
+                    let item = self.queue.remove(from);
+                    self.queue.insert(to, item);
+                    if let Some(cur) = self.current_index {
+                        self.current_index = Some(if cur == from {
+                            to
+                        } else if from < cur && cur <= to {
+                            cur - 1
+                        } else if to <= cur && cur < from {
+                            cur + 1
+                        } else {
+                            cur
+                        });
+                    }
+                }
+                Task::none()
+            }
+            Message::SetSleepTimer(mins_opt) => {
+                if let Some(restore) = self.sleep_restore_vol.take() {
+                    self.audio.set_volume(if self.muted { 0.0 } else { restore });
+                }
+                match mins_opt {
+                    Some(mins) if mins > 0 => {
+                        self.sleep_deadline = Some(Instant::now() + Duration::from_secs(mins * 60));
+                        self.sleep_target_mins = mins;
+                        self.show_toast(format!("Sleep timer set for {mins}m"));
+                    }
+                    _ => {
+                        self.sleep_deadline = None;
+                        self.sleep_target_mins = 0;
+                        self.show_toast("Sleep timer cleared");
+                    }
+                }
+                Task::none()
+            }
+            Message::OpenCommandPalette => {
+                self.show_command_palette = true;
+                self.palette_query.clear();
+                self.hide_suggestions();
+                operation::focus(self.palette_input_id.clone())
+            }
+            Message::CloseCommandPalette => {
+                self.show_command_palette = false;
+                Task::none()
+            }
+            Message::CommandPaletteChanged(s) => {
+                self.palette_query = s;
+                Task::none()
+            }
+            Message::CommandPaletteSubmit => {
+                let actions = self.filtered_palette_actions();
+                self.show_command_palette = false;
+                if let Some((_, action, _)) = actions.first() {
+                    return self.execute_palette_action(*action);
+                }
+                let q = self.palette_query.trim().to_string();
+                if !q.is_empty() {
+                    self.query = q.clone();
+                    return self.run_search(q);
+                }
+                Task::none()
+            }
+            Message::RunPaletteAction(action) => {
+                self.show_command_palette = false;
+                self.execute_palette_action(action)
+            }
+            Message::QuickVibe(vibe) => {
+                self.query = vibe.clone();
+                self.run_search(vibe)
+            }
             Message::Tick => {
+                if let Some((_, exp)) = &self.toast
+                    && Instant::now() >= *exp
+                {
+                    self.toast = None;
+                }
+
+                // Sleep timer fade-out during the last 10 seconds & auto-pause on expiry
+                if let Some(deadline) = self.sleep_deadline {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        self.sleep_deadline = None;
+                        self.sleep_target_mins = 0;
+                        let restore = self.sleep_restore_vol.take().unwrap_or(self.volume);
+                        if self.playback == PlaybackState::Playing {
+                            self.audio.toggle_pause();
+                            self.playback = PlaybackState::Paused;
+                        }
+                        self.audio.set_volume(if self.muted { 0.0 } else { restore });
+                        self.show_toast("Sleep timer finished — playback paused");
+                    } else {
+                        let rem = (deadline - now).as_secs_f32();
+                        if rem <= 10.0 && !self.muted {
+                            let base = *self.sleep_restore_vol.get_or_insert(self.volume);
+                            self.audio.set_volume(base * (rem / 10.0).clamp(0.0, 1.0));
+                        }
+                    }
+                }
+
+                // Smooth FFT spectrum + peak gravity + phase advance for silky visualizers
+                let raw = self.audio.spectrum();
+                if self.playback == PlaybackState::Playing {
+                    self.anim_phase = (self.anim_phase + 0.065) % (TAU * 100.0);
+                    for i in 0..32 {
+                        let target = raw.bands[i];
+                        let cur = self.display_spectrum.bands[i];
+                        let smoothed = if target > cur {
+                            cur + (target - cur) * 0.58
+                        } else {
+                            cur * 0.78 + target * 0.22
+                        };
+                        self.display_spectrum.bands[i] = smoothed;
+                        self.display_spectrum.peaks[i] =
+                            (self.display_spectrum.peaks[i] - 0.015).max(smoothed);
+                    }
+                    self.display_spectrum.bass =
+                        self.display_spectrum.bass * 0.45 + raw.bass * 0.55;
+                    self.display_spectrum.rms =
+                        self.display_spectrum.rms * 0.55 + raw.rms * 0.45;
+                } else {
+                    for i in 0..32 {
+                        self.display_spectrum.bands[i] *= 0.80;
+                        self.display_spectrum.peaks[i] *= 0.82;
+                    }
+                    self.display_spectrum.bass *= 0.80;
+                    self.display_spectrum.rms *= 0.80;
+                }
+
                 let snap = self.audio.take_snapshot();
                 if snap.seq != self.play_seq {
                     return Task::none();
@@ -1150,6 +1596,9 @@ impl Hum {
     }
 
     fn navigate_to(&mut self, target: Page) {
+        if target != Page::UpNext {
+            self.zen_mode = false;
+        }
         if !matches!(self.page, Page::Playlist | Page::UpNext) {
             self.prev_page = self.page;
         }
@@ -1270,9 +1719,144 @@ impl Hum {
             return self.start_track(0);
         }
 
+        if !manual
+            && self.settings.auto_radio
+            && let Some(cur_track) = self.now_playing.clone()
+        {
+            self.playback = PlaybackState::Loading;
+            self.position = Duration::ZERO;
+            return self.trigger_radio(cur_track, true);
+        }
+
         self.playback = PlaybackState::Stopped;
         self.position = Duration::ZERO;
         Task::none()
+    }
+
+    fn show_toast(&mut self, msg: impl Into<String>) {
+        let msg_str = msg.into();
+        self.toast = Some((msg_str, Instant::now() + Duration::from_secs(3)));
+    }
+
+    fn apply_dsp(&mut self) {
+        self.audio.set_dsp(self.dsp);
+        self.settings.eq_preset = self.eq_preset;
+        self.settings.eq_gains = self.dsp.eq_gains;
+        self.settings.reverb_mix = self.dsp.reverb_mix;
+        self.settings.playback_speed = self.dsp.speed;
+        auth::save_settings(&self.settings);
+    }
+
+    fn is_slowed_reverb(&self) -> bool {
+        self.dsp.speed <= 0.90 && self.dsp.reverb_mix >= 0.30
+    }
+
+    fn is_nightcore(&self) -> bool {
+        self.dsp.speed >= 1.15
+    }
+
+    fn sleep_remaining_label(&self) -> Option<String> {
+        let deadline = self.sleep_deadline?;
+        let secs = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let mins = secs.div_ceil(60).max(1);
+        Some(if secs < 60 {
+            format!("{secs}s")
+        } else {
+            format!("{mins}m")
+        })
+    }
+
+    fn trigger_radio(&mut self, seed: Track, auto: bool) -> Task<Message> {
+        if self.radio_loading {
+            return Task::none();
+        }
+        self.radio_loading = true;
+        let client = self.client.clone();
+        let auth = self.current_ytm_auth();
+        let seed_id = seed.id;
+        Task::perform(
+            async move {
+                let result = ytmusic::fetch_radio_tracks(&client, &seed_id, auth.as_ref()).await;
+                (seed_id, auto, result)
+            },
+            |(seed_id, auto, result)| Message::RadioLoaded {
+                seed_id,
+                auto,
+                result,
+            },
+        )
+    }
+
+    fn palette_catalog() -> Vec<(&'static str, PaletteAction, &'static str)> {
+        vec![
+            ("Play / Pause", PaletteAction::TogglePause, "Space"),
+            ("Next Track", PaletteAction::NextTrack, "Ctrl+Right"),
+            ("Previous Track", PaletteAction::PrevTrack, "Ctrl+Left"),
+            ("Open Sound Lab (EQ & FX)", PaletteAction::OpenSoundLab, "Ctrl+E"),
+            ("Toggle Slowed + Reverb", PaletteAction::ToggleSlowedReverb, "Ctrl+Shift+S"),
+            ("Toggle Nightcore", PaletteAction::ToggleNightcore, ""),
+            ("Open Live Lyrics", PaletteAction::OpenLyrics, "Ctrl+L"),
+            ("Open Up Next Queue", PaletteAction::OpenQueue, ""),
+            ("Toggle Zen Cinema Mode", PaletteAction::ToggleZenMode, "Ctrl+Shift+Z"),
+            ("Cycle Audio Visualizer", PaletteAction::CycleVisualizer, "Ctrl+Shift+V"),
+            ("Start Radio From Current Song", PaletteAction::StartRadio, ""),
+            ("Toggle Endless Auto-Radio", PaletteAction::ToggleAutoRadio, ""),
+            ("EQ Preset: Bass Boost", PaletteAction::SelectPreset(EqPreset::BassBoost), ""),
+            ("EQ Preset: Late Night", PaletteAction::SelectPreset(EqPreset::LateNight), ""),
+            ("EQ Preset: Vocal Clarity", PaletteAction::SelectPreset(EqPreset::Vocal), ""),
+            ("EQ Preset: Electronic", PaletteAction::SelectPreset(EqPreset::Electronic), ""),
+            ("EQ Preset: Lo-Fi", PaletteAction::SelectPreset(EqPreset::LoFi), ""),
+            ("EQ Preset: Flat", PaletteAction::SelectPreset(EqPreset::Flat), ""),
+            ("Sleep Timer: 15 Minutes", PaletteAction::SetSleep(Some(15)), ""),
+            ("Sleep Timer: 30 Minutes", PaletteAction::SetSleep(Some(30)), ""),
+            ("Sleep Timer: Turn Off", PaletteAction::SetSleep(None), ""),
+            ("Go to Home", PaletteAction::OpenHome, ""),
+            ("Go to Explore", PaletteAction::OpenExplore, ""),
+            ("Go to Library", PaletteAction::OpenLibrary, ""),
+            ("Go to Settings", PaletteAction::OpenSettings, ""),
+        ]
+    }
+
+    fn filtered_palette_actions(&self) -> Vec<(&'static str, PaletteAction, &'static str)> {
+        let q = self.palette_query.trim().to_ascii_lowercase();
+        let all = Self::palette_catalog();
+        if q.is_empty() {
+            return all.into_iter().take(10).collect();
+        }
+        all.into_iter()
+            .filter(|(label, _, _)| label.to_ascii_lowercase().contains(&q))
+            .take(10)
+            .collect()
+    }
+
+    fn execute_palette_action(&mut self, action: PaletteAction) -> Task<Message> {
+        match action {
+            PaletteAction::TogglePause => self.update(Message::TogglePause),
+            PaletteAction::NextTrack => self.update(Message::NextTrack),
+            PaletteAction::PrevTrack => self.update(Message::PrevTrack),
+            PaletteAction::OpenHome => self.update(Message::OpenPage(Page::Home)),
+            PaletteAction::OpenExplore => self.update(Message::OpenPage(Page::Explore)),
+            PaletteAction::OpenLibrary => self.update(Message::OpenPage(Page::Library)),
+            PaletteAction::OpenSoundLab => self.update(Message::OpenPage(Page::SoundLab)),
+            PaletteAction::OpenLyrics => self.update(Message::OpenLyricsPage),
+            PaletteAction::OpenQueue => self.update(Message::OpenQueuePage),
+            PaletteAction::OpenSettings => self.update(Message::OpenPage(Page::Settings)),
+            PaletteAction::CycleVisualizer => self.update(Message::CycleVisualizer),
+            PaletteAction::ToggleZenMode => self.update(Message::ToggleZenMode),
+            PaletteAction::ToggleSlowedReverb => self.update(Message::ToggleSlowedReverb),
+            PaletteAction::ToggleNightcore => self.update(Message::ToggleNightcore),
+            PaletteAction::ToggleAutoRadio => self.update(Message::ToggleAutoRadio),
+            PaletteAction::StartRadio => {
+                if let Some(t) = self.now_playing.clone() {
+                    self.update(Message::StartRadio(t))
+                } else {
+                    self.show_toast("Play a song first to start Radio");
+                    Task::none()
+                }
+            }
+            PaletteAction::SetSleep(m) => self.update(Message::SetSleepTimer(m)),
+            PaletteAction::SelectPreset(p) => self.update(Message::SelectEqPreset(p)),
+        }
     }
 
     fn current_ytm_auth(&self) -> Option<YtmAuth> {
@@ -1498,26 +2082,64 @@ impl Hum {
             container(self.view_up_next())
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(style::now_playing_canvas(self.active_palette))
                 .into()
         } else {
-            container(
-                row![self.view_sidebar(), self.view_main_column()]
-                    .width(Length::Fill)
-                    .height(Length::Fill),
+            row![self.view_sidebar(), self.view_main_column()]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+
+        let foreground: Element<'_, Message> = if self.zen_mode && self.page == Page::UpNext {
+            top_area
+        } else {
+            column![top_area, self.view_player_bar()]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+
+        let backdrop = canvas(AmbientBackdrop {
+            palette: self.active_palette,
+            bass: self.display_spectrum.bass,
+            phase: self.anim_phase,
+            intense: self.page == Page::UpNext,
+            enabled: self.settings.ambient_glow,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        let mut base: Element<'_, Message> = stack![backdrop, foreground].into();
+
+        if let Some((msg, _)) = &self.toast {
+            let toast_overlay = container(
+                container(
+                    row![
+                        icons::sparkles(14.0, self.active_palette.accent),
+                        text(msg).size(13).color(style::TEXT_PRIMARY),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding([9, 16])
+                .style(style::toast_banner(self.active_palette.accent)),
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(style::ambient_canvas(self.active_palette))
-            .into()
-        };
+            .align_x(Alignment::Center)
+            .align_y(Alignment::End)
+            .padding(Padding {
+                top: 0.0,
+                right: 24.0,
+                bottom: 92.0,
+                left: 24.0,
+            });
+            base = stack![base, toast_overlay].into();
+        }
 
-        let base: Element<'_, Message> = column![top_area, self.view_player_bar()]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-
-        if self.show_update_modal
+        if self.show_command_palette {
+            stack![base, self.view_command_palette_modal()].into()
+        } else if self.show_update_modal
             && let Some(info) = &self.available_update
         {
             stack![base, self.view_update_modal(info)].into()
@@ -1564,6 +2186,10 @@ impl Hum {
                 self.nav_icon_button(
                     Page::Library,
                     icons::library(18.0, icon_color(self.page == Page::Library)).into(),
+                ),
+                self.nav_icon_button(
+                    Page::SoundLab,
+                    icons::sliders(18.0, icon_color(self.page == Page::SoundLab)).into(),
                 ),
                 self.nav_icon_button(
                     Page::UpNext,
@@ -1617,10 +2243,13 @@ impl Hum {
                 .center_y(28)
                 .style(style::brand_circle),
             text("hum").size(19).color(style::TEXT_PRIMARY),
+            container(text("PRO").size(9).color(self.active_palette.accent))
+                .padding([2, 6])
+                .style(style::fx_badge(self.active_palette.accent)),
             space::horizontal().width(Length::Fill),
             toggle_btn,
         ]
-        .spacing(10)
+        .spacing(8)
         .align_y(Alignment::Center)
         .padding([14, 16]);
 
@@ -1639,6 +2268,11 @@ impl Hum {
                 "Library",
                 Page::Library,
                 icons::library(18.0, icon_color(self.page == Page::Library)).into()
+            ),
+            self.nav_button(
+                "Sound Lab",
+                Page::SoundLab,
+                icons::sliders(18.0, icon_color(self.page == Page::SoundLab)).into()
             ),
             self.nav_button(
                 "Now Playing",
@@ -1731,7 +2365,7 @@ impl Hum {
                 container(text(account_label).size(11).color(style::TEXT_MUTED))
                     .padding([6, 16]),
             ]
-            .width(212)
+            .width(214)
             .height(Length::Fill),
         )
         .style(style::sidebar)
@@ -1746,6 +2380,7 @@ impl Hum {
             Page::Search => self.view_search_results(),
             Page::Library => self.view_library(),
             Page::UpNext => self.view_up_next(),
+            Page::SoundLab => self.view_sound_lab_page(),
             Page::Settings => self.view_settings(),
             Page::Playlist => self.view_playlist_or_browse(),
             Page::UserPlaylist(idx) => self.view_user_playlist(idx),
@@ -1811,14 +2446,26 @@ impl Hum {
             .spacing(8)
             .align_y(Alignment::Center),
         )
-        .max_width(440)
+        .max_width(420)
         .width(Length::Fill);
+
+        let cmd_btn = button(
+            row![
+                icons::command(13.0, style::TEXT_SECONDARY),
+                text("Ctrl+K").size(11).color(style::TEXT_SECONDARY),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::OpenCommandPalette)
+        .padding([7, 11])
+        .style(style::pill_button(false));
 
         let mut right_actions = row![].spacing(10).align_y(Alignment::Center);
 
         if let Some(note) = &self.status_note {
             right_actions = right_actions.push(
-                text(truncate_text(note, 36))
+                text(truncate_text(note, 34))
                     .size(12)
                     .color(style::TEXT_SECONDARY),
             );
@@ -1872,6 +2519,7 @@ impl Hum {
             row![
                 nav_history,
                 search_box,
+                cmd_btn,
                 space::horizontal().width(Length::Fill),
                 right_actions,
             ]
@@ -1898,7 +2546,118 @@ impl Hum {
             .into();
         }
 
-        let mut col = column![].spacing(28).padding([20, 26]);
+        let mut col = column![].spacing(24).padding([18, 26]);
+
+        let greeting = match &self.google_session {
+            Some(s) => format!("Welcome back, {}", truncate_text(&s.user_name, 20)),
+            None => String::from("Your music, pure speed"),
+        };
+        let hero_header = row![
+            column![
+                text(greeting).size(26).color(style::TEXT_PRIMARY),
+                text(format!(
+                    "{} liked  •  {} recent  •  Visualizer: {}  •  Radio: {}",
+                    self.liked_tracks.len(),
+                    self.history.len(),
+                    self.visualizer.label(),
+                    if self.settings.auto_radio { "ON" } else { "OFF" }
+                ))
+                .size(12)
+                .color(style::TEXT_SECONDARY),
+            ]
+            .spacing(4)
+            .width(Length::Fill),
+            button(
+                row![
+                    icons::sliders(14.0, style::TEXT_PRIMARY),
+                    text("Sound Lab").size(12),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::OpenPage(Page::SoundLab))
+            .padding([8, 14])
+            .style(style::chip_button(false, self.active_palette.accent)),
+        ]
+        .align_y(Alignment::Center);
+        col = col.push(hero_header);
+
+        let vibes = [
+            ("Chill", "chill lo-fi beats"),
+            ("Late Night", "late night r&b"),
+            ("Focus", "deep focus instrumental"),
+            ("Workout", "high energy workout phonk"),
+            ("Phonk", "drift phonk bass"),
+            ("Hip-Hop", "rap hits"),
+        ];
+        let mut vibe_row = row![].spacing(8);
+        for (label, query) in vibes {
+            vibe_row = vibe_row.push(
+                button(text(label).size(12))
+                    .on_press(Message::QuickVibe(query.to_string()))
+                    .padding([7, 14])
+                    .style(style::chip_button(false, self.active_palette.accent)),
+            );
+        }
+        col = col.push(scrollable(vibe_row).horizontal());
+
+        if let Some(latest) = self.history.first() {
+            let jump_card = container(
+                row![
+                    container(self.render_thumb(latest.thumb_url.as_deref(), 82.0, 12.0))
+                        .style(style::cover_glow(self.active_palette.accent)),
+                    column![
+                        text("JUMP BACK IN")
+                            .size(10)
+                            .color(self.active_palette.accent),
+                        text(truncate_text(&latest.title, 34))
+                            .size(19)
+                            .color(style::TEXT_PRIMARY),
+                        text(truncate_text(display_artist(&latest.artist), 34))
+                            .size(13)
+                            .color(style::TEXT_SECONDARY),
+                    ]
+                    .spacing(4)
+                    .width(Length::Fill),
+                    row![
+                        button(
+                            row![
+                                icons::play(13.0, style::BG_CANVAS),
+                                text("Resume").size(13),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::PlayTrackList {
+                            tracks: self.history.iter().take(12).cloned().collect(),
+                            index: 0,
+                        })
+                        .padding([9, 18])
+                        .style(style::pill_button(true)),
+                        button(
+                            row![
+                                icons::radio(14.0, style::TEXT_PRIMARY),
+                                text("Radio").size(13),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::StartRadio(latest.clone()))
+                        .padding([9, 16])
+                        .style(style::pill_button(false)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(16)
+                .align_y(Alignment::Center),
+            )
+            .padding(16)
+            .width(Length::Fill)
+            .style(style::accent_card(self.active_palette.accent));
+
+            col = col.push(jump_card);
+        }
 
         if !self.history.is_empty() {
             let mut recent_row = row![].spacing(14);
@@ -2538,55 +3297,226 @@ impl Hum {
     }
 
     fn view_up_next(&self) -> Element<'_, Message> {
+        let accent = self.active_palette.accent;
         let back_target = if self.prev_page == Page::UpNext {
             Page::Home
         } else {
             self.prev_page
         };
 
-        let left_panel: Element<'_, Message> = if let Some(track) = &self.now_playing {
-            let liked = self.liked_ids.contains(&track.id);
-            container(
-                column![
-                    self.render_thumb(track.thumb_url.as_deref(), 320.0, 16.0),
-                    space::vertical().height(10),
+        if self.zen_mode {
+            let zen_controls = row![
+                space::horizontal().width(Length::Fill),
+                button(
+                    row![
+                        icons::wave(14.0, accent),
+                        text(format!("Visualizer: {}", self.visualizer.label())).size(12),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::CycleVisualizer)
+                .padding([7, 14])
+                .style(style::chip_button(true, accent)),
+                button(
+                    row![
+                        icons::minimize(14.0, style::TEXT_PRIMARY),
+                        text("Exit Zen (Esc)").size(12),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::ToggleZenMode)
+                .padding([7, 14])
+                .style(style::pill_button(false)),
+            ]
+            .spacing(10)
+            .padding([18, 28]);
+
+            let left_zen: Element<'_, Message> = if let Some(track) = &self.now_playing {
+                let liked = self.liked_ids.contains(&track.id);
+                let play_icon = match self.playback {
+                    PlaybackState::Playing => icons::pause(17.0, style::BG_CANVAS),
+                    PlaybackState::Loading => icons::note(15.0, style::BG_CANVAS),
+                    PlaybackState::Paused | PlaybackState::Stopped => {
+                        icons::play(17.0, style::BG_CANVAS)
+                    }
+                };
+                let mut col = column![
+                    container(self.render_thumb(track.thumb_url.as_deref(), 360.0, 18.0))
+                        .style(style::cover_glow(accent)),
+                    space::vertical().height(6),
                     text(truncate_text(&track.title, 34))
-                        .size(24)
+                        .size(28)
                         .color(style::TEXT_PRIMARY),
                     text(truncate_text(display_artist(&track.artist), 38))
-                        .size(15)
+                        .size(16)
                         .color(style::TEXT_SECONDARY),
-                    space::vertical().height(4),
-                    row![
-                        button(icons::heart(
-                            18.0,
-                            if liked {
-                                self.active_palette.accent
-                            } else {
-                                style::TEXT_SECONDARY
-                            },
-                            liked
-                        ))
-                        .on_press(Message::ToggleLike(track.clone()))
-                        .padding(9)
-                        .style(style::icon_button),
-                        button(icons::plus(18.0, style::TEXT_SECONDARY))
-                            .on_press(Message::OpenAddToPlaylist(track.clone()))
-                            .padding(9)
-                            .style(style::icon_button),
-                    ]
-                    .spacing(10),
                 ]
                 .spacing(6)
-                .width(320)
-                .align_x(Alignment::Start),
-            )
-            .padding([12, 32])
-            .width(Length::FillPortion(5))
+                .width(360)
+                .align_x(Alignment::Start);
+
+                if self.visualizer != VisualizerMode::Off {
+                    col = col.push(
+                        canvas(AudioVisualizer {
+                            mode: self.visualizer,
+                            spectrum: self.display_spectrum,
+                            palette: self.active_palette,
+                            phase: self.anim_phase,
+                        })
+                        .width(360)
+                        .height(100),
+                    );
+                }
+
+                col = col.push(
+                    row![
+                        button(icons::prev(18.0, style::TEXT_PRIMARY))
+                            .on_press(Message::PrevTrack)
+                            .padding(8)
+                            .style(style::icon_button),
+                        button(play_icon)
+                            .on_press(Message::TogglePause)
+                            .width(42)
+                            .height(42)
+                            .padding(11)
+                            .style(style::play_circle),
+                        button(icons::next(18.0, style::TEXT_PRIMARY))
+                            .on_press(Message::NextTrack)
+                            .padding(8)
+                            .style(style::icon_button),
+                        space::horizontal().width(Length::Fill),
+                        button(icons::heart(
+                            18.0,
+                            if liked { accent } else { style::TEXT_SECONDARY },
+                            liked,
+                        ))
+                        .on_press(Message::ToggleLike(track.clone()))
+                        .padding(8)
+                        .style(style::icon_button),
+                        button(icons::radio(18.0, style::TEXT_SECONDARY))
+                            .on_press(Message::StartRadio(track.clone()))
+                            .padding(8)
+                            .style(style::icon_button),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                );
+
+                container(col)
+                    .padding([12, 32])
+                    .width(Length::FillPortion(5))
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
+            } else {
+                container(text("Pick a song to enter Zen Cinema").size(16).color(style::TEXT_MUTED))
+                    .width(Length::FillPortion(5))
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
+            };
+
+            let right_zen = container(self.view_lyrics_column(true))
+                .padding([12, 36])
+                .width(Length::FillPortion(6))
+                .height(Length::Fill);
+
+            return column![
+                zen_controls,
+                row![left_zen, right_zen]
+                    .spacing(20)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            ]
+            .width(Length::Fill)
             .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into()
+            .into();
+        }
+
+        let left_panel: Element<'_, Message> = if let Some(track) = &self.now_playing {
+            let liked = self.liked_ids.contains(&track.id);
+            let mut art_col = column![
+                container(self.render_thumb(track.thumb_url.as_deref(), 296.0, 16.0))
+                    .style(style::cover_glow(accent)),
+                space::vertical().height(4),
+                text(truncate_text(&track.title, 32))
+                    .size(23)
+                    .color(style::TEXT_PRIMARY),
+                text(truncate_text(display_artist(&track.artist), 36))
+                    .size(14)
+                    .color(style::TEXT_SECONDARY),
+            ]
+            .spacing(5)
+            .width(296)
+            .align_x(Alignment::Start);
+
+            if self.visualizer != VisualizerMode::Off {
+                art_col = art_col.push(
+                    canvas(AudioVisualizer {
+                        mode: self.visualizer,
+                        spectrum: self.display_spectrum,
+                        palette: self.active_palette,
+                        phase: self.anim_phase,
+                    })
+                    .width(296)
+                    .height(74),
+                );
+            }
+
+            let mut fx_row = row![
+                button(icons::heart(
+                    18.0,
+                    if liked { accent } else { style::TEXT_SECONDARY },
+                    liked
+                ))
+                .on_press(Message::ToggleLike(track.clone()))
+                .padding(8)
+                .style(style::icon_button),
+                button(icons::plus(18.0, style::TEXT_SECONDARY))
+                    .on_press(Message::OpenAddToPlaylist(track.clone()))
+                    .padding(8)
+                    .style(style::icon_button),
+                button(
+                    row![
+                        icons::radio(14.0, style::TEXT_PRIMARY),
+                        text(if self.radio_loading { "Loading..." } else { "Radio" }).size(12),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::StartRadio(track.clone()))
+                .padding([6, 12])
+                .style(style::chip_button(false, accent)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+            if self.is_slowed_reverb() {
+                fx_row = fx_row.push(
+                    container(text("SLOWED + REV").size(10).color(accent))
+                        .padding([4, 8])
+                        .style(style::fx_badge(accent)),
+                );
+            } else if self.is_nightcore() {
+                fx_row = fx_row.push(
+                    container(text("NIGHTCORE").size(10).color(accent))
+                        .padding([4, 8])
+                        .style(style::fx_badge(accent)),
+                );
+            }
+            art_col = art_col.push(fx_row);
+
+            container(art_col)
+                .padding([12, 28])
+                .width(Length::FillPortion(5))
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
         } else {
             container(
                 text("Pick a song to start listening")
@@ -2615,16 +3545,49 @@ impl Hum {
             space::horizontal().width(Length::Fill),
             button(text("Lyrics").size(13))
                 .on_press(Message::SetUpNextTab(UpNextTab::Lyrics))
-                .padding([7, 16])
-                .style(style::pill_button(self.up_next_tab == UpNextTab::Lyrics)),
+                .padding([7, 15])
+                .style(style::chip_button(self.up_next_tab == UpNextTab::Lyrics, accent)),
             button(text(format!("Up next ({})", self.queue.len())).size(13))
                 .on_press(Message::SetUpNextTab(UpNextTab::Queue))
-                .padding([7, 16])
-                .style(style::pill_button(self.up_next_tab == UpNextTab::Queue)),
+                .padding([7, 15])
+                .style(style::chip_button(self.up_next_tab == UpNextTab::Queue, accent)),
+            button(
+                row![
+                    icons::sliders(13.0, style::TEXT_PRIMARY),
+                    text("Sound Lab").size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::SetUpNextTab(UpNextTab::SoundLab))
+            .padding([7, 14])
+            .style(style::chip_button(self.up_next_tab == UpNextTab::SoundLab, accent)),
+            button(
+                row![
+                    icons::wave(13.0, accent),
+                    text(self.visualizer.label()).size(12),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::CycleVisualizer)
+            .padding([7, 12])
+            .style(style::pill_button(false)),
+            button(
+                row![
+                    icons::maximize(13.0, style::TEXT_PRIMARY),
+                    text("Zen").size(12),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::ToggleZenMode)
+            .padding([7, 12])
+            .style(style::pill_button(false)),
         ]
-        .spacing(10)
+        .spacing(8)
         .align_y(Alignment::Center)
-        .padding([18, 28]);
+        .padding([16, 28]);
 
         let right_panel: Element<'_, Message> = match self.up_next_tab {
             UpNextTab::Queue => {
@@ -2635,18 +3598,60 @@ impl Hum {
                         .style(style::pill_button(false)),
                 );
 
-                let mut queue_rows = column![].spacing(4);
+                let queue_header = row![
+                    text("PLAYING QUEUE").size(11).color(style::TEXT_MUTED),
+                    space::horizontal().width(Length::Fill),
+                    button(
+                        row![
+                            icons::radio(13.0, if self.settings.auto_radio { accent } else { style::TEXT_MUTED }),
+                            text(if self.settings.auto_radio {
+                                "Auto-Radio: ON"
+                            } else {
+                                "Auto-Radio: OFF"
+                            })
+                            .size(12),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::ToggleAutoRadio)
+                    .padding([5, 11])
+                    .style(style::chip_button(self.settings.auto_radio, accent)),
+                ]
+                .align_y(Alignment::Center)
+                .padding([0, 4]);
+
+                let mut queue_rows = column![queue_header].spacing(6);
+                let total_q = self.queue.len();
                 for (i, track) in self.queue.iter().enumerate() {
                     let is_active = self.current_index == Some(i);
-                    queue_rows = queue_rows.push(self.view_track_row(
-                        track,
-                        is_active,
-                        Message::PlayTrackList {
-                            tracks: self.queue.clone(),
-                            index: i,
-                        },
-                        Some(Message::RemoveFromQueue(i)),
-                    ));
+                    let up_btn = button(icons::arrow_up(13.0, style::TEXT_MUTED))
+                        .on_press_maybe((i > 0).then_some(Message::MoveQueueItem { from: i, to: i.saturating_sub(1) }))
+                        .padding(5)
+                        .style(style::icon_button);
+                    let down_btn = button(icons::arrow_down(13.0, style::TEXT_MUTED))
+                        .on_press_maybe((i + 1 < total_q).then_some(Message::MoveQueueItem { from: i, to: i + 1 }))
+                        .padding(5)
+                        .style(style::icon_button);
+
+                    queue_rows = queue_rows.push(
+                        row![
+                            up_btn,
+                            down_btn,
+                            container(self.view_track_row(
+                                track,
+                                is_active,
+                                Message::PlayTrackList {
+                                    tracks: self.queue.clone(),
+                                    index: i,
+                                },
+                                Some(Message::RemoveFromQueue(i)),
+                            ))
+                            .width(Length::Fill),
+                        ]
+                        .spacing(2)
+                        .align_y(Alignment::Center),
+                    );
                 }
 
                 container(
@@ -2654,7 +3659,7 @@ impl Hum {
                         .width(Length::Fill)
                         .height(Length::Fill),
                 )
-                .padding([8, 32])
+                .padding([8, 28])
                 .width(Length::FillPortion(6))
                 .height(Length::Fill)
                 .into()
@@ -2671,123 +3676,25 @@ impl Hum {
                     top_bar = top_bar.push(
                         container(text(badge).size(11).color(style::TEXT_SECONDARY))
                             .padding([5, 11])
-                            .style(style::glass_card),
+                            .style(style::floating_card),
                     );
                 }
 
-                let lyrics_body: Element<'_, Message> = if let Some(track) = &self.now_playing {
-                    if self.lyrics_loading {
-                        container(
-                            text("Loading lyrics...")
-                                .size(15)
-                                .color(style::TEXT_MUTED),
-                        )
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill)
-                        .into()
-                    } else {
-                        match self.lyrics_cache.get(&track.id) {
-                            Some(Ok(lyrics)) if lyrics.synced => {
-                                let active_idx = self.current_lyric_index().map(|(i, _)| i);
-                                let mut lines_col =
-                                    column![space::vertical().height(64)].spacing(10);
-
-                                for (i, line) in lyrics.lines.iter().enumerate() {
-                                    let is_active = active_idx == Some(i);
-                                    let is_past = active_idx.is_some_and(|cur| i < cur);
-
-                                    let color = if is_active {
-                                        style::TEXT_PRIMARY
-                                    } else if is_past {
-                                        Color::from_rgba(1.0, 1.0, 1.0, 0.42)
-                                    } else {
-                                        Color::from_rgba(1.0, 1.0, 1.0, 0.28)
-                                    };
-                                    let font_size = if is_active { 25 } else { 18 };
-
-                                    let mut btn = button(
-                                        text(&line.text)
-                                            .size(font_size)
-                                            .color(color)
-                                            .width(Length::Fill),
-                                    )
-                                    .padding([8, 14])
-                                    .width(Length::Fill)
-                                    .style(style::lyric_row);
-
-                                    if let Some(ms) = line.time_ms {
-                                        btn = btn.on_press(Message::SeekToMs(ms));
-                                    }
-                                    lines_col = lines_col.push(btn);
-                                }
-
-                                lines_col = lines_col.push(space::vertical().height(110));
-
-                                scrollable(lines_col.padding([0, 10]))
-                                    .id(self.lyrics_scroll_id.clone())
-                                    .width(Length::Fill)
-                                    .height(Length::Fill)
-                                    .into()
-                            }
-                            Some(Ok(lyrics)) => {
-                                let mut lines_col =
-                                    column![space::vertical().height(16)].spacing(12);
-                                for line in &lyrics.lines {
-                                    lines_col = lines_col.push(
-                                        text(&line.text)
-                                            .size(18)
-                                            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.85)),
-                                    );
-                                }
-                                lines_col = lines_col.push(space::vertical().height(48));
-
-                                scrollable(lines_col.padding([0, 10]))
-                                    .id(self.lyrics_scroll_id.clone())
-                                    .width(Length::Fill)
-                                    .height(Length::Fill)
-                                    .into()
-                            }
-                            Some(Err(err)) => container(
-                                text(err).size(14).color(style::TEXT_MUTED),
-                            )
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .center_x(Length::Fill)
-                            .center_y(Length::Fill)
-                            .into(),
-                            None => container(
-                                text("Loading lyrics...")
-                                    .size(14)
-                                    .color(style::TEXT_MUTED),
-                            )
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .center_x(Length::Fill)
-                            .center_y(Length::Fill)
-                            .into(),
-                        }
-                    }
-                } else {
-                    container(
-                        text("Pick a song to see live lyrics")
-                            .size(14)
-                            .color(style::TEXT_MUTED),
-                    )
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill)
-                    .into()
-                };
-
-                container(lyrics_body)
-                    .padding([8, 32])
+                container(self.view_lyrics_column(false))
+                    .padding([8, 28])
                     .width(Length::FillPortion(6))
                     .height(Length::Fill)
                     .into()
             }
+            UpNextTab::SoundLab => container(
+                scrollable(self.view_sound_lab_content(false))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .padding([8, 28])
+            .width(Length::FillPortion(6))
+            .height(Length::Fill)
+            .into(),
         };
 
         column![
@@ -2800,6 +3707,398 @@ impl Hum {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    fn view_lyrics_column(&self, large: bool) -> Element<'_, Message> {
+        let Some(track) = &self.now_playing else {
+            return container(
+                text("Pick a song to see live lyrics")
+                    .size(15)
+                    .color(style::TEXT_MUTED),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+        };
+
+        if self.lyrics_loading {
+            return container(
+                text("Loading lyrics...")
+                    .size(15)
+                    .color(style::TEXT_MUTED),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+        }
+
+        match self.lyrics_cache.get(&track.id) {
+            Some(Ok(lyrics)) if lyrics.synced => {
+                let active_idx = self.current_lyric_index().map(|(i, _)| i);
+                let mut lines_col = column![space::vertical().height(64)].spacing(10);
+                let accent = self.active_palette.accent;
+
+                for (i, line) in lyrics.lines.iter().enumerate() {
+                    let is_active = active_idx == Some(i);
+                    let is_past = active_idx.is_some_and(|cur| i < cur);
+
+                    let color = if is_active {
+                        style::TEXT_PRIMARY
+                    } else if is_past {
+                        Color::from_rgba(1.0, 1.0, 1.0, 0.42)
+                    } else {
+                        Color::from_rgba(1.0, 1.0, 1.0, 0.28)
+                    };
+                    let font_size = match (large, is_active) {
+                        (true, true) => 28,
+                        (true, false) => 19,
+                        (false, true) => 25,
+                        (false, false) => 18,
+                    };
+
+                    let bar = container(space::horizontal().width(4).height(24)).style(move |_: &Theme| {
+                        container::Style {
+                            background: Some(Background::Color(if is_active {
+                                accent
+                            } else {
+                                Color::TRANSPARENT
+                            })),
+                            border: iced::Border {
+                                radius: 2.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    });
+
+                    let mut btn = button(
+                        row![
+                            bar,
+                            text(&line.text)
+                                .size(font_size)
+                                .color(color)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([8, 14])
+                    .width(Length::Fill)
+                    .style(style::lyric_row);
+
+                    if let Some(ms) = line.time_ms {
+                        btn = btn.on_press(Message::SeekToMs(ms));
+                    }
+                    lines_col = lines_col.push(btn);
+                }
+
+                lines_col = lines_col.push(space::vertical().height(110));
+
+                scrollable(lines_col.padding([0, 10]))
+                    .id(self.lyrics_scroll_id.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            Some(Ok(lyrics)) => {
+                let mut lines_col = column![space::vertical().height(16)].spacing(12);
+                for line in &lyrics.lines {
+                    lines_col = lines_col.push(
+                        text(&line.text)
+                            .size(if large { 20 } else { 18 })
+                            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.86)),
+                    );
+                }
+                lines_col = lines_col.push(space::vertical().height(48));
+
+                scrollable(lines_col.padding([0, 10]))
+                    .id(self.lyrics_scroll_id.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            Some(Err(err)) => container(text(err).size(14).color(style::TEXT_MUTED))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into(),
+            None => container(
+                text("Loading lyrics...")
+                    .size(14)
+                    .color(style::TEXT_MUTED),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into(),
+        }
+    }
+
+    fn view_sound_lab_page(&self) -> Element<'_, Message> {
+        let content = self.view_sound_lab_content(true).max_width(900).padding([22, 28]);
+        scrollable(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_sound_lab_content(&self, full_page: bool) -> iced::widget::Column<'_, Message> {
+        let accent = self.active_palette.accent;
+        let mut col = column![].spacing(18);
+
+        if full_page {
+            col = col.push(
+                row![
+                    column![
+                        text("Sound Lab").size(26).color(style::TEXT_PRIMARY),
+                        text("Real-time 5-band parametric EQ, studio reverb, speed DSP & live FFT visualizers")
+                            .size(13)
+                            .color(style::TEXT_SECONDARY),
+                    ]
+                    .spacing(4)
+                    .width(Length::Fill),
+                    button(text("Reset all").size(12))
+                        .on_press(Message::ResetSoundLab)
+                        .padding([7, 14])
+                        .style(style::pill_button(false)),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+
+        // 1. Live GPU Canvas Spectrum Visualizer
+        let mut viz_modes = row![].spacing(6);
+        for mode in [
+            VisualizerMode::Bars,
+            VisualizerMode::Wave,
+            VisualizerMode::Halo,
+            VisualizerMode::Off,
+        ] {
+            viz_modes = viz_modes.push(
+                button(text(mode.label()).size(12))
+                    .on_press(Message::SetVisualizer(mode))
+                    .padding([5, 12])
+                    .style(style::chip_button(self.visualizer == mode, accent)),
+            );
+        }
+
+        let viz_card = container(
+            column![
+                row![
+                    row![
+                        icons::wave(15.0, accent),
+                        text("Live Audio Spectrum").size(14).color(style::TEXT_PRIMARY),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill),
+                    viz_modes,
+                ]
+                .align_y(Alignment::Center),
+                canvas(AudioVisualizer {
+                    mode: self.visualizer,
+                    spectrum: self.display_spectrum,
+                    palette: self.active_palette,
+                    phase: self.anim_phase,
+                })
+                .width(Length::Fill)
+                .height(if full_page { 155 } else { 115 }),
+            ]
+            .spacing(12),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::floating_card);
+        col = col.push(viz_card);
+
+        // 2. Vibe FX Studio (Slowed + Reverb, Nightcore, Speed, Reverb)
+        let slowed_active = self.is_slowed_reverb();
+        let nightcore_active = self.is_nightcore();
+
+        let fx_card = container(
+            column![
+                row![
+                    text("Vibe FX Engine").size(15).color(style::TEXT_PRIMARY).width(Length::Fill),
+                    row![
+                        button(
+                            row![
+                                icons::moon(13.0, style::TEXT_PRIMARY),
+                                text("Slowed + Reverb").size(12),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::ToggleSlowedReverb)
+                        .padding([7, 14])
+                        .style(style::chip_button(slowed_active, accent)),
+                        button(
+                            row![
+                                icons::sparkles(13.0, style::TEXT_PRIMARY),
+                                text("Nightcore").size(12),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::ToggleNightcore)
+                        .padding([7, 14])
+                        .style(style::chip_button(nightcore_active, accent)),
+                        button(text("Reset FX").size(12))
+                            .on_press(Message::ResetSoundLab)
+                            .padding([7, 12])
+                            .style(style::pill_button(false)),
+                    ]
+                    .spacing(8),
+                ]
+                .align_y(Alignment::Center),
+                row![
+                    column![
+                        text("Playback Speed").size(12).color(style::TEXT_SECONDARY),
+                        text(format!("{:.2}x", self.dsp.speed))
+                            .size(14)
+                            .color(style::TEXT_PRIMARY),
+                    ]
+                    .width(120),
+                    slider(0.75..=1.50, self.dsp.speed, Message::SetPlaybackSpeed)
+                        .step(0.01_f32)
+                        .width(Length::Fill)
+                        .style(style::eq_slider(accent)),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+                row![
+                    column![
+                        text("Studio Reverb").size(12).color(style::TEXT_SECONDARY),
+                        text(format!("{}%", (self.dsp.reverb_mix * 100.0).round() as u32))
+                            .size(14)
+                            .color(style::TEXT_PRIMARY),
+                    ]
+                    .width(120),
+                    slider(0.0..=1.0, self.dsp.reverb_mix, Message::SetReverbMix)
+                        .step(0.01_f32)
+                        .width(Length::Fill)
+                        .style(style::eq_slider(accent)),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::accent_card(accent));
+        col = col.push(fx_card);
+
+        // 3. 5-Band Parametric Equalizer
+        let mut preset_row = row![].spacing(8);
+        for &preset in EqPreset::all_presets() {
+            preset_row = preset_row.push(
+                button(text(preset.label()).size(12))
+                    .on_press(Message::SelectEqPreset(preset))
+                    .padding([6, 12])
+                    .style(style::chip_button(self.eq_preset == preset, accent)),
+            );
+        }
+
+        let mut bands_row = row![].spacing(12).align_y(Alignment::Center);
+        for (idx, label) in EQ_BAND_LABELS.iter().enumerate() {
+            let db = self.dsp.eq_gains[idx];
+            let db_str = if db > 0.05 {
+                format!("+{db:.1}")
+            } else {
+                format!("{db:.1}")
+            };
+            bands_row = bands_row.push(
+                container(
+                    column![
+                        text(db_str).size(12).color(accent),
+                        vertical_slider(-12.0..=12.0, db, move |v| Message::SetEqBand(idx, v))
+                            .step(0.5_f32)
+                            .height(130)
+                            .style(style::eq_slider(accent)),
+                        text(*label).size(12).color(style::TEXT_SECONDARY),
+                    ]
+                    .spacing(8)
+                    .align_x(Alignment::Center),
+                )
+                .padding([10, 6])
+                .width(Length::FillPortion(1)),
+            );
+        }
+
+        let eq_card = container(
+            column![
+                row![
+                    text("5-Band Equalizer").size(15).color(style::TEXT_PRIMARY),
+                    space::horizontal().width(Length::Fill),
+                    scrollable(preset_row).horizontal(),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                bands_row,
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::floating_card);
+        col = col.push(eq_card);
+
+        // 4. Sleep Timer
+        let sleep_label = match self.sleep_remaining_label() {
+            Some(rem) => format!("Active: {rem} remaining (smooth fade on end)"),
+            None => String::from("Pause playback automatically after a timer"),
+        };
+        let sleep_card = container(
+            row![
+                column![
+                    row![
+                        icons::moon(14.0, accent),
+                        text("Sleep Timer").size(14).color(style::TEXT_PRIMARY),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    text(sleep_label).size(12).color(style::TEXT_MUTED),
+                ]
+                .spacing(4)
+                .width(Length::Fill),
+                row![
+                    button(text("Off").size(12))
+                        .on_press(Message::SetSleepTimer(None))
+                        .padding([6, 11])
+                        .style(style::chip_button(self.sleep_deadline.is_none(), accent)),
+                    button(text("15m").size(12))
+                        .on_press(Message::SetSleepTimer(Some(15)))
+                        .padding([6, 11])
+                        .style(style::chip_button(self.sleep_deadline.is_some() && self.sleep_target_mins == 15, accent)),
+                    button(text("30m").size(12))
+                        .on_press(Message::SetSleepTimer(Some(30)))
+                        .padding([6, 11])
+                        .style(style::chip_button(self.sleep_deadline.is_some() && self.sleep_target_mins == 30, accent)),
+                    button(text("45m").size(12))
+                        .on_press(Message::SetSleepTimer(Some(45)))
+                        .padding([6, 11])
+                        .style(style::chip_button(self.sleep_deadline.is_some() && self.sleep_target_mins == 45, accent)),
+                    button(text("60m").size(12))
+                        .on_press(Message::SetSleepTimer(Some(60)))
+                        .padding([6, 11])
+                        .style(style::chip_button(self.sleep_deadline.is_some() && self.sleep_target_mins == 60, accent)),
+                ]
+                .spacing(6),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::floating_card);
+        col = col.push(sleep_card);
+
+        col
     }
 
     fn view_settings(&self) -> Element<'_, Message> {
@@ -2994,20 +4293,94 @@ impl Hum {
         .width(Length::Fill)
         .style(style::modal_card);
 
+        let accent = self.active_palette.accent;
+        let mut viz_chips = row![].spacing(6);
+        for mode in [
+            VisualizerMode::Bars,
+            VisualizerMode::Wave,
+            VisualizerMode::Halo,
+            VisualizerMode::Off,
+        ] {
+            viz_chips = viz_chips.push(
+                button(text(mode.label()).size(12))
+                    .on_press(Message::SetVisualizer(mode))
+                    .padding([6, 11])
+                    .style(style::chip_button(self.visualizer == mode, accent)),
+            );
+        }
+
+        let visuals_card = container(
+            column![
+                text("Experience & Visuals").size(15).color(style::TEXT_PRIMARY),
+                row![
+                    column![
+                        text("Ambient reactive glow").size(13).color(style::TEXT_PRIMARY),
+                        text("Soft animated album-art aura behind every screen.")
+                            .size(12)
+                            .color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text(if self.settings.ambient_glow { "On" } else { "Off" }).size(12))
+                        .on_press(Message::ToggleAmbientGlow)
+                        .padding([7, 14])
+                        .style(style::chip_button(self.settings.ambient_glow, accent)),
+                ]
+                .align_y(Alignment::Center),
+                row![
+                    column![
+                        text("Endless Auto-Radio").size(13).color(style::TEXT_PRIMARY),
+                        text("Automatically queue matching tracks when finishing a song.")
+                            .size(12)
+                            .color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text(if self.settings.auto_radio { "On" } else { "Off" }).size(12))
+                        .on_press(Message::ToggleAutoRadio)
+                        .padding([7, 14])
+                        .style(style::chip_button(self.settings.auto_radio, accent)),
+                ]
+                .align_y(Alignment::Center),
+                row![
+                    column![
+                        text("Visualizer style").size(13).color(style::TEXT_PRIMARY),
+                        text("GPU spectrum style in Now Playing & Sound Lab.")
+                            .size(12)
+                            .color(style::TEXT_MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    viz_chips,
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(style::floating_card);
+
         let shortcuts_card = container(
             column![
                 text("Keyboard Shortcuts").size(15).color(style::TEXT_PRIMARY),
-                row![text("Space").size(12).color(style::TEXT_PRIMARY).width(140), text("Play / Pause").size(12).color(style::TEXT_MUTED)],
-                row![text("Ctrl+F / Ctrl+K").size(12).color(style::TEXT_PRIMARY).width(140), text("Focus search bar").size(12).color(style::TEXT_MUTED)],
-                row![text("Ctrl+Right").size(12).color(style::TEXT_PRIMARY).width(140), text("Next track").size(12).color(style::TEXT_MUTED)],
-                row![text("Ctrl+Left").size(12).color(style::TEXT_PRIMARY).width(140), text("Previous track / restart").size(12).color(style::TEXT_MUTED)],
-                row![text("Esc").size(12).color(style::TEXT_PRIMARY).width(140), text("Close open modal").size(12).color(style::TEXT_MUTED)],
+                row![text("Space").size(12).color(style::TEXT_PRIMARY).width(160), text("Play / Pause").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+K").size(12).color(style::TEXT_PRIMARY).width(160), text("Open Spotlight Command Palette").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+F").size(12).color(style::TEXT_PRIMARY).width(160), text("Focus search bar").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+E").size(12).color(style::TEXT_PRIMARY).width(160), text("Toggle Sound Lab (EQ & FX)").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+L").size(12).color(style::TEXT_PRIMARY).width(160), text("Toggle Live Lyrics").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+Shift+S").size(12).color(style::TEXT_PRIMARY).width(160), text("Toggle Slowed + Reverb").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+Shift+V").size(12).color(style::TEXT_PRIMARY).width(160), text("Cycle audio visualizer").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+Shift+Z").size(12).color(style::TEXT_PRIMARY).width(160), text("Toggle Zen Cinema Mode").size(12).color(style::TEXT_MUTED)],
+                row![text("Ctrl+Left / Right").size(12).color(style::TEXT_PRIMARY).width(160), text("Previous / Next track").size(12).color(style::TEXT_MUTED)],
+                row![text("Shift+Left / Right").size(12).color(style::TEXT_PRIMARY).width(160), text("Seek -10s / +10s").size(12).color(style::TEXT_MUTED)],
+                row![text("Esc").size(12).color(style::TEXT_PRIMARY).width(160), text("Exit Zen Mode or close modal").size(12).color(style::TEXT_MUTED)],
             ]
             .spacing(8),
         )
         .padding(18)
         .width(Length::Fill)
-        .style(style::modal_card);
+        .style(style::floating_card);
 
         let check_label = if self.checking_update {
             "Checking..."
@@ -3056,6 +4429,7 @@ impl Hum {
         let content = column![
             text("Settings").size(26).color(style::TEXT_PRIMARY),
             account_card,
+            visuals_card,
             playback_card,
             data_card,
             shortcuts_card,
@@ -3175,16 +4549,16 @@ impl Hum {
 
         let left_track: Element<'_, Message> = if let Some(track) = &self.now_playing {
             let liked = self.liked_ids.contains(&track.id);
-            row![
+            let mut row_left = row![
                 button(self.render_thumb(track.thumb_url.as_deref(), 46.0, 6.0))
                     .on_press(Message::OpenPage(Page::UpNext))
                     .padding(0)
                     .style(style::icon_button),
                 column![
-                    text(truncate_text(&track.title, 30))
+                    text(truncate_text(&track.title, 26))
                         .size(14)
                         .color(style::TEXT_PRIMARY),
-                    text(truncate_text(display_artist(&track.artist), 30))
+                    text(truncate_text(display_artist(&track.artist), 26))
                         .size(12)
                         .color(style::TEXT_SECONDARY),
                 ]
@@ -3202,10 +4576,29 @@ impl Hum {
                 .padding(7)
                 .style(style::icon_button),
             ]
-            .spacing(12)
+            .spacing(10)
             .align_y(Alignment::Center)
-            .width(Length::FillPortion(3))
-            .into()
+            .width(Length::FillPortion(3));
+
+            let fx_tag = if self.is_slowed_reverb() {
+                Some("SLOWED")
+            } else if self.is_nightcore() {
+                Some("NC")
+            } else if self.eq_preset != EqPreset::Flat || self.dsp.reverb_mix > 0.01 || (self.dsp.speed - 1.0).abs() > 0.01 {
+                Some("FX")
+            } else {
+                None
+            };
+            if let Some(tag) = fx_tag {
+                row_left = row_left.push(
+                    button(text(tag).size(10).color(self.active_palette.accent))
+                        .on_press(Message::OpenPage(Page::SoundLab))
+                        .padding([3, 8])
+                        .style(style::chip_button(true, self.active_palette.accent)),
+                );
+            }
+
+            row_left.into()
         } else {
             row![text("Nothing playing").size(13).color(style::TEXT_MUTED)]
                 .align_y(Alignment::Center)
@@ -3268,53 +4661,110 @@ impl Hum {
             icons::volume(17.0, style::TEXT_SECONDARY)
         };
 
-        let right_controls = row![
+        let mut mini_bands = [0.0_f32; 8];
+        for (i, slot) in mini_bands.iter_mut().enumerate() {
+            *slot = self.display_spectrum.bands[i * 4];
+        }
+
+        let mut right_controls = row![
             space::horizontal().width(Length::Fill),
-            text(format!(
-                "{} / {}",
-                format_time(current_secs as u64),
-                format_time(total_secs as u64)
-            ))
-            .size(12)
-            .color(style::TEXT_SECONDARY),
-            button(vol_icon)
-                .on_press(Message::ToggleMute)
-                .padding(7)
-                .style(style::icon_button),
-            slider(
-                0.0..=1.0,
-                if self.muted { 0.0 } else { self.volume },
-                Message::VolumeChanged
-            )
-            .step(0.02_f32)
-            .style(style::volume_slider)
-            .width(80),
-            button(icons::lyrics(
-                17.0,
-                if self.page == Page::UpNext && self.up_next_tab == UpNextTab::Lyrics {
-                    self.active_palette.accent
-                } else {
-                    style::TEXT_SECONDARY
-                }
-            ))
-            .on_press(Message::OpenLyricsPage)
-            .padding(8)
-            .style(style::icon_button),
-            button(icons::queue(
-                18.0,
-                if self.page == Page::UpNext && self.up_next_tab == UpNextTab::Queue {
-                    self.active_palette.accent
-                } else {
-                    style::TEXT_SECONDARY
-                }
-            ))
-            .on_press(Message::OpenQueuePage)
-            .padding(8)
-            .style(style::icon_button),
+            canvas(MiniMeter {
+                bands: mini_bands,
+                accent: self.active_palette.accent,
+                playing: self.playback == PlaybackState::Playing,
+            })
+            .width(28)
+            .height(16),
         ]
         .spacing(6)
         .align_y(Alignment::Center)
         .width(Length::FillPortion(3));
+
+        if let Some(sleep_rem) = self.sleep_remaining_label() {
+            right_controls = right_controls.push(
+                button(
+                    row![
+                        icons::moon(11.0, self.active_palette.accent),
+                        text(sleep_rem).size(10).color(self.active_palette.accent),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::OpenPage(Page::SoundLab))
+                .padding([3, 7])
+                .style(style::chip_button(true, self.active_palette.accent)),
+            );
+        }
+
+        right_controls = right_controls
+            .push(
+                text(format!(
+                    "{} / {}",
+                    format_time(current_secs as u64),
+                    format_time(total_secs as u64)
+                ))
+                .size(12)
+                .color(style::TEXT_SECONDARY),
+            )
+            .push(
+                button(vol_icon)
+                    .on_press(Message::ToggleMute)
+                    .padding(7)
+                    .style(style::icon_button),
+            )
+            .push(
+                slider(
+                    0.0..=1.0,
+                    if self.muted { 0.0 } else { self.volume },
+                    Message::VolumeChanged,
+                )
+                .step(0.02_f32)
+                .style(style::volume_slider)
+                .width(76),
+            )
+            .push(
+                button(icons::sliders(
+                    16.0,
+                    if self.page == Page::SoundLab {
+                        self.active_palette.accent
+                    } else {
+                        style::TEXT_SECONDARY
+                    },
+                ))
+                .on_press(Message::OpenPage(if self.page == Page::SoundLab {
+                    self.prev_page
+                } else {
+                    Page::SoundLab
+                }))
+                .padding(8)
+                .style(style::icon_button),
+            )
+            .push(
+                button(icons::lyrics(
+                    17.0,
+                    if self.page == Page::UpNext && self.up_next_tab == UpNextTab::Lyrics {
+                        self.active_palette.accent
+                    } else {
+                        style::TEXT_SECONDARY
+                    },
+                ))
+                .on_press(Message::OpenLyricsPage)
+                .padding(8)
+                .style(style::icon_button),
+            )
+            .push(
+                button(icons::queue(
+                    18.0,
+                    if self.page == Page::UpNext && self.up_next_tab == UpNextTab::Queue {
+                        self.active_palette.accent
+                    } else {
+                        style::TEXT_SECONDARY
+                    },
+                ))
+                .on_press(Message::OpenQueuePage)
+                .padding(8)
+                .style(style::icon_button),
+            );
 
         container(
             column![
@@ -3753,6 +5203,103 @@ impl Hum {
             .center_y(Length::Fill)
             .style(|_: &Theme| container::Style {
                 background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.72))),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_command_palette_modal(&self) -> Element<'_, Message> {
+        let accent = self.active_palette.accent;
+        let matches = self.filtered_palette_actions();
+
+        let search_row = row![
+            icons::command(16.0, accent),
+            text_input("Run any action or search music...", &self.palette_query)
+                .id(self.palette_input_id.clone())
+                .on_input(Message::CommandPaletteChanged)
+                .on_submit(Message::CommandPaletteSubmit)
+                .padding([10, 12])
+                .size(14)
+                .style(style::plain_input)
+                .width(Length::Fill),
+            button(text("Esc").size(11))
+                .on_press(Message::CloseCommandPalette)
+                .padding([6, 10])
+                .style(style::pill_button(false)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let mut list_col = column![].spacing(4);
+        for (i, (label, action, hint)) in matches.into_iter().enumerate() {
+            let mut row_item = row![
+                icons::sparkles(13.0, if i == 0 { accent } else { style::TEXT_MUTED }),
+                text(label).size(13).color(style::TEXT_PRIMARY).width(Length::Fill),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center);
+
+            if !hint.is_empty() {
+                row_item = row_item.push(
+                    container(text(hint).size(11).color(style::TEXT_SECONDARY))
+                        .padding([2, 8])
+                        .style(style::glass_card),
+                );
+            }
+
+            list_col = list_col.push(
+                button(row_item)
+                    .on_press(Message::RunPaletteAction(action))
+                    .padding([9, 12])
+                    .width(Length::Fill)
+                    .style(style::track_row(i == 0)),
+            );
+        }
+
+        let trimmed = self.palette_query.trim();
+        if !trimmed.is_empty() {
+            list_col = list_col.push(
+                button(
+                    row![
+                        icons::search(14.0, accent),
+                        text(format!("Search YouTube Music for \"{trimmed}\""))
+                            .size(13)
+                            .color(style::TEXT_PRIMARY),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::CommandPaletteSubmit)
+                .padding([9, 12])
+                .width(Length::Fill)
+                .style(style::track_row(false)),
+            );
+        }
+
+        let modal = container(
+            column![
+                search_row,
+                container(scrollable(list_col)).max_height(340),
+            ]
+            .spacing(12),
+        )
+            .padding(18)
+            .max_width(540)
+            .width(Length::Fill)
+            .style(style::command_modal(accent));
+
+        container(modal)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding {
+                top: 90.0,
+                right: 24.0,
+                bottom: 24.0,
+                left: 24.0,
+            })
+            .center_x(Length::Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.68))),
                 ..Default::default()
             })
             .into()
